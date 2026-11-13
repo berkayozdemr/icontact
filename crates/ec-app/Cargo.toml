@@ -1,0 +1,11 @@
+[package]
+name = "ec-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-capture.workspace = true
+eframe = "0.37.0"

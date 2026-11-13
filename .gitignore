@@ -1,0 +1,16 @@
+target/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+# downloaded model files and recordings stay out of git
+spike/models/
+spike/samples/
+spike/out/
+spike/rust-tests/target/
+*.y4m
+*.onnx
+*.tflite
+*.task
+spike/third_party/
