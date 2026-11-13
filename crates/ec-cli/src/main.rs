@@ -10,6 +10,7 @@ use ec_capture::{
 };
 use ec_core::stats::Timings;
 use ec_core::{PixelFormat, Rect};
+use ec_vision::FaceTracker;
 
 const USAGE: &str = "\
 ec-cli cameras
@@ -19,6 +20,9 @@ ec-cli capture [--camera N] [--frames N] [--size WxH] [--save FILE.ppm]
     --save writes the last frame as a picture, to check colours by eye.
 ec-cli bench (--clip FILE.y4m | --synthetic nv12|i420|yuyv|rgb|bgr) [--frames N] [--size WxH]
     Time each pipeline stage. --size applies to --synthetic only.
+ec-cli track --clip FILE.y4m [--frames N] [--threads N] [--raw] [--points FILE.csv]
+    Run the face tracker over a clip and time it. --raw switches smoothing off.
+    --points writes every frame's 478 points (x,y) as CSV.
 ec-cli make-clip FILE.y4m [--frames N] [--size WxH]
     Write a generated test clip.";
 
@@ -34,6 +38,17 @@ impl Args {
                 Ok(Some(self.0.remove(i)))
             }
             Some(_) => Err(format!("{name} needs a value")),
+        }
+    }
+
+    /// True if `--name` was given; removed from the list.
+    fn flag(&mut self, name: &str) -> bool {
+        match self.0.iter().position(|a| a == name) {
+            Some(i) => {
+                self.0.remove(i);
+                true
+            }
+            None => false,
         }
     }
 
@@ -243,7 +258,83 @@ fn bench(mut a: Args) -> Result<(), String> {
     line("two eye-sized regions to RGB", &crops);
     line("all of the above", &total);
     println!("  (checksum {checksum})");
-    println!("stages not built yet: face tracking, gaze, eye correction, composite, fake camera");
+    println!("face tracking has its own command: ec-cli track\nstages not built yet: gaze, eye correction, composite, fake camera");
+    Ok(())
+}
+
+/// Run the face tracker over a clip: timings, how often the face was held, and
+/// optionally every point of every frame as CSV (for comparing with the Python reference).
+fn track(mut a: Args) -> Result<(), String> {
+    let clip = a.value("--clip")?.ok_or("track needs --clip FILE.y4m")?;
+    let frames: usize = a.number("--frames", usize::MAX)?;
+    let threads: usize = a.number("--threads", 1)?;
+    let points_path = a.value("--points")?;
+    let raw = a.flag("--raw");
+    a.done()?;
+    let mut source = Y4mSource::open(&clip, false).map_err(|e| e.to_string())?;
+    let fps = source.nominal_fps().unwrap_or(30.0);
+    println!("source: {}", source.describe());
+    let mut tracker = FaceTracker::new(threads).map_err(|e| e.to_string())?;
+    tracker.smoothing = !raw;
+    let mut csv = match &points_path {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::File::create(p).map_err(|e| format!("{p}: {e}"))?,
+        )),
+        None => None,
+    };
+    let (mut detect, mut mesh, mut total) =
+        (Timings::default(), Timings::default(), Timings::default());
+    let (mut seen, mut with_face, mut redetected) = (0usize, 0usize, 0usize);
+    let (mut open, mut yaw, mut pitch) =
+        (Timings::default(), Timings::default(), Timings::default());
+    while seen < frames {
+        let Some(frame) = source.next_frame().map_err(|e| e.to_string())? else {
+            break;
+        };
+        let t = Instant::now();
+        let face = tracker
+            .track(&frame, seen as f64 / fps)
+            .map_err(|e| e.to_string())?;
+        total.push(t.elapsed().as_secs_f64() * 1000.0);
+        if let Some(d) = tracker.last_times.detect_ms {
+            detect.push(d);
+        }
+        if let Some(face) = &face {
+            mesh.push(tracker.last_times.mesh_ms);
+            with_face += 1;
+            redetected += face.redetected as usize;
+            open.push(((face.eye_open[0] + face.eye_open[1]) / 2.0) as f64);
+            yaw.push(face.head.yaw as f64);
+            pitch.push(face.head.pitch as f64);
+        }
+        if let Some(out) = csv.as_mut() {
+            use std::io::Write;
+            let mut row = format!("{seen}");
+            for p in face.iter().flat_map(|f| f.points.iter()) {
+                row += &format!(",{:.2},{:.2}", p[0], p[1]);
+            }
+            writeln!(out, "{row}").map_err(|e| e.to_string())?;
+        }
+        seen += 1;
+    }
+    println!(
+        "{seen} frames, face in {with_face}, detector ran {} times ({redetected} found a face), {threads} thread(s), smoothing {}:",
+        detect.len(),
+        if raw { "off" } else { "on" }
+    );
+    line("face detector (when it runs)", &detect);
+    line("cut square + face mesh model", &mesh);
+    line("whole tracker, per frame", &total);
+    let range = |t: &Timings| match (t.percentile(0.0), t.median(), t.percentile(1.0)) {
+        (Some(a), Some(b), Some(c)) => format!("min {a:.2}  median {b:.2}  max {c:.2}"),
+        _ => "-".into(),
+    };
+    println!("  eye openness (both eyes' mean)      {}", range(&open));
+    println!("  head yaw, degrees                   {}", range(&yaw));
+    println!("  head pitch, degrees                 {}", range(&pitch));
+    if let Some(p) = points_path {
+        println!("points written to {p}");
+    }
     Ok(())
 }
 
@@ -276,6 +367,7 @@ fn main() -> ExitCode {
         "cameras" => Args(args).done().and_then(|()| cameras()),
         "capture" => capture(Args(args)),
         "bench" => bench(Args(args)),
+        "track" => track(Args(args)),
         "make-clip" => make_clip(Args(args)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

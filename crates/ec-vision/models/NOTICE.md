@@ -1,0 +1,14 @@
+# Model files in this folder
+
+| File | What it is | From | Licence |
+|---|---|---|---|
+| `face_detector.onnx` | Face detector ("BlazeFace short range") | Google MediaPipe, inside `face_landmarker.task` | Apache-2.0 |
+| `face_landmarks_detector.onnx` | Face mesh, 478 points with iris | Google MediaPipe, inside `face_landmarker.task` | Apache-2.0 |
+
+Both were taken out of
+`https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`
+(a zip file) and converted from TFLite to ONNX with `tf2onnx --tflite`, unchanged
+otherwise. On one test crop the converted mesh model gives the same points as
+the original to within 0.001 px.
+
+They are built into the executable with `include_bytes!`, so the app is one file.

@@ -1,28 +1,33 @@
-//! Icontact app, milestone 1: a window that shows the live camera (T-024).
+//! Icontact app, milestone 2: a window that shows the live camera (T-024) with
+//! the face tracker's points drawn on top (T-036).
 //! No correction, tray icon or fake camera yet.
 //!
 //!     ec-app                 camera 0
 //!     ec-app --camera 1      another camera
 //!     ec-app --pattern       a generated moving picture instead of a camera
+//!     ec-app --clip F.y4m    a recorded clip, looped, instead of a camera
 //!     --exit-after SECS      print the read-out and close (for smoke tests)
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ec_capture::{
-    request_camera_permission, CameraSource, CaptureError, FrameSource, SyntheticSource,
+    request_camera_permission, CameraSource, CaptureError, FrameSource, SyntheticSource, Y4mSource,
 };
 use ec_core::stats::Timings;
-use ec_core::{slot, Frame, PixelFormat, SlotReceiver};
+use ec_core::{slot, Frame, PixelFormat, SlotReceiver, SlotSender};
+use ec_vision::{points, Face, FaceTracker};
 use eframe::egui;
 
 enum Source {
     Camera(u32),
     Pattern,
+    Clip(String),
 }
 
-/// Status from the capture thread. These go through an ordinary queue, because unlike
+/// Status from the worker threads. These go through an ordinary queue, because unlike
 /// frames none of them may be dropped: the frame slot would let the first frame
 /// overwrite `Opened` before the window had read it.
 enum Status {
@@ -33,19 +38,22 @@ enum Status {
 /// Runs on its own thread: opens the source and pushes every frame into the one-place slot.
 fn capture_loop(
     source: Source,
-    frames: ec_core::SlotSender<Frame>,
+    frames: SlotSender<Frame>,
     status: mpsc::Sender<Status>,
     ctx: egui::Context,
 ) {
-    let opened: Result<Box<dyn FrameSource>, CaptureError> = match source {
+    let opened: Result<Box<dyn FrameSource>, CaptureError> = match &source {
         Source::Pattern => Ok(Box::new(SyntheticSource::new(
             1280,
             720,
             PixelFormat::Nv12,
             None,
         ))),
+        Source::Clip(path) => {
+            Y4mSource::open(path, true).map(|c| Box::new(c) as Box<dyn FrameSource>)
+        }
         Source::Camera(i) => request_camera_permission(Duration::from_secs(120))
-            .and_then(|()| CameraSource::open(i, 1280, 720, 30))
+            .and_then(|()| CameraSource::open(*i, 1280, 720, 30))
             .map(|c| Box::new(c) as Box<dyn FrameSource>),
     };
     let mut src = match opened {
@@ -56,13 +64,13 @@ fn capture_loop(
             return;
         }
     };
-    let paced = matches!(source, Source::Pattern);
+    let paced = !matches!(source, Source::Camera(_));
     let _ = status.send(Status::Opened(src.describe()));
     ctx.request_repaint();
     let mut next = Instant::now();
     loop {
         let failure = match src.next_frame() {
-            // an Err from the slot means the window is gone
+            // an Err from the slot means the pipeline thread is gone
             Ok(Some(f)) => match frames.send(f) {
                 Ok(_) => None,
                 Err(_) => return,
@@ -70,22 +78,90 @@ fn capture_loop(
             Ok(None) => Some("the source ended".to_string()),
             Err(e) => Some(e.to_string()),
         };
-        ctx.request_repaint();
         if let Some(reason) = failure {
             let _ = status.send(Status::Failed(reason));
+            ctx.request_repaint();
             return;
         }
         if paced {
-            // the test pattern has no clock of its own, so give it 30 frames a second
+            // a test pattern or clip has no clock of its own, so give it 30 frames a second
             next += Duration::from_millis(33);
             thread::sleep(next.saturating_duration_since(Instant::now()));
         }
     }
 }
 
+/// What the pipeline thread hands the window: the frame and what was found in it.
+struct Tracked {
+    frame: Frame,
+    face: Option<Face>,
+    /// Time spent tracking this frame, in milliseconds. `None`: tracking was off.
+    track_ms: Option<f64>,
+}
+
+/// Runs on its own thread: takes each frame from the capture thread, finds the face,
+/// and passes both on to the window. The rest of the pipeline will be added here.
+fn pipeline_loop(
+    frames: SlotReceiver<Frame>,
+    out: SlotSender<Tracked>,
+    status: mpsc::Sender<Status>,
+    tracking_on: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    let mut tracker = match FaceTracker::new(1) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            let _ = status.send(Status::Failed(format!("face tracking is off: {e}")));
+            None
+        }
+    };
+    let mut first_frame_at = None;
+    // `recv` waits for the next frame, and returns `None` once the capture thread is gone
+    while let Some(frame) = frames.recv() {
+        let epoch = *first_frame_at.get_or_insert(frame.captured_at);
+        let time = frame
+            .captured_at
+            .saturating_duration_since(epoch)
+            .as_secs_f64();
+        let mut face = None;
+        let mut track_ms = None;
+        if !tracking_on.load(Ordering::Relaxed) {
+            if let Some(t) = tracker.as_mut() {
+                t.reset();
+            }
+        } else if let Some(t) = tracker.as_mut() {
+            let started = Instant::now();
+            match t.track(&frame, time) {
+                Ok(found) => {
+                    face = found;
+                    track_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                Err(e) => {
+                    let _ = status.send(Status::Failed(format!("face tracking stopped: {e}")));
+                    tracker = None;
+                }
+            }
+        }
+        let tracked = Tracked {
+            frame,
+            face,
+            track_ms,
+        };
+        // an Err from the slot means the window is gone
+        if out.send(tracked).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}
+
 struct App {
-    rx: SlotReceiver<Frame>,
+    rx: SlotReceiver<Tracked>,
     status: mpsc::Receiver<Status>,
+    /// Shared with the pipeline thread, which reads it for every frame.
+    tracking_on: Arc<AtomicBool>,
+    show_points: bool,
+    face: Option<Face>,
     started: Instant,
     exit_after: Option<Duration>,
     texture: Option<egui::TextureHandle>,
@@ -94,8 +170,106 @@ struct App {
     frame_line: String,
     convert: Timings,
     arrivals: Timings,
+    track: Timings,
     last_arrival: Option<Instant>,
     shown: u64,
+    with_face: u64,
+}
+
+impl App {
+    /// Take the newest frame, if one is waiting, and load it as the picture to draw.
+    fn take_frame(&mut self, ctx: &egui::Context) {
+        let Some(tracked) = self.rx.try_recv() else {
+            return;
+        };
+        let f = tracked.frame;
+        let now = Instant::now();
+        if let Some(prev) = self.last_arrival.replace(now) {
+            self.arrivals.push((now - prev).as_secs_f64() * 1000.0);
+            self.arrivals.keep_last(90);
+        }
+        let t = Instant::now();
+        let rgb = f.to_rgb();
+        let image = egui::ColorImage::from_rgb([f.width() as usize, f.height() as usize], &rgb);
+        match &mut self.texture {
+            Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                self.texture = Some(ctx.load_texture("camera", image, egui::TextureOptions::LINEAR))
+            }
+        }
+        self.convert.push(t.elapsed().as_secs_f64() * 1000.0);
+        self.convert.keep_last(90);
+        if let Some(ms) = tracked.track_ms {
+            self.track.push(ms);
+            self.track.keep_last(90);
+        }
+        self.shown += 1;
+        self.with_face += tracked.face.is_some() as u64;
+        self.face = tracked.face;
+        self.frame_line = format!("{}x{} {:?}", f.width(), f.height(), f.format());
+    }
+
+    fn tracking_line(&self) -> String {
+        match (&self.face, self.track.median()) {
+            (Some(f), Some(ms)) => format!(
+                "tracking {ms:.1} ms   sure {:.0}%   head: turn {:+.0}°  nod {:+.0}°  tilt {:+.0}°   eyes open {:.2} / {:.2}",
+                f.confidence * 100.0,
+                f.head.yaw,
+                f.head.pitch,
+                f.head.roll,
+                f.eye_open[0],
+                f.eye_open[1],
+            ),
+            (None, Some(ms)) => format!("tracking {ms:.1} ms   no face"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Draw what the tracker found on top of the picture (T-036).
+/// `origin` is the picture's top-left corner on screen, `scale` is screen points per frame pixel.
+fn draw_points(painter: &egui::Painter, origin: egui::Pos2, scale: f32, face: &Face) {
+    let at = |x: f32, y: f32| origin + egui::vec2(x, y) * scale;
+    let faint = egui::Color32::from_rgba_unmultiplied(120, 220, 255, 110);
+    let eye = egui::Color32::from_rgb(90, 255, 120);
+    let iris = egui::Color32::from_rgb(255, 210, 60);
+
+    // the square the mesh model looked at
+    let corners: Vec<egui::Pos2> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        .iter()
+        .map(|&(u, v)| {
+            let (x, y) = face.roi.to_frame(u, v);
+            at(x, y)
+        })
+        .collect();
+    painter.add(egui::Shape::closed_line(
+        corners,
+        egui::Stroke::new(1.0, faint),
+    ));
+
+    for p in &face.points {
+        painter.circle_filled(at(p[0], p[1]), 1.0, faint);
+    }
+    let mark = |i: usize, radius: f32, colour: egui::Color32| {
+        if let Some(p) = face.points.get(i) {
+            painter.circle_filled(at(p[0], p[1]), radius, colour);
+        }
+    };
+    for i in [
+        points::LEFT_EYE_OUTER,
+        points::LEFT_EYE_INNER,
+        points::LEFT_EYE_TOP,
+        points::LEFT_EYE_BOTTOM,
+        points::RIGHT_EYE_INNER,
+        points::RIGHT_EYE_OUTER,
+        points::RIGHT_EYE_TOP,
+        points::RIGHT_EYE_BOTTOM,
+    ] {
+        mark(i, 2.5, eye);
+    }
+    for i in points::LEFT_IRIS.chain(points::RIGHT_IRIS) {
+        mark(i, 2.0, iris);
+    }
 }
 
 impl eframe::App for App {
@@ -106,35 +280,7 @@ impl eframe::App for App {
                 Status::Failed(e) => self.error = Some(e),
             }
         }
-        {
-            {
-                if let Some(f) = self.rx.try_recv() {
-                    let now = Instant::now();
-                    if let Some(prev) = self.last_arrival.replace(now) {
-                        self.arrivals.push((now - prev).as_secs_f64() * 1000.0);
-                        self.arrivals.keep_last(90);
-                    }
-                    let t = Instant::now();
-                    let rgb = f.to_rgb();
-                    let image =
-                        egui::ColorImage::from_rgb([f.width() as usize, f.height() as usize], &rgb);
-                    match &mut self.texture {
-                        Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                        None => {
-                            self.texture = Some(ui.ctx().load_texture(
-                                "camera",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ))
-                        }
-                    }
-                    self.convert.push(t.elapsed().as_secs_f64() * 1000.0);
-                    self.convert.keep_last(90);
-                    self.shown += 1;
-                    self.frame_line = format!("{}x{} {:?}", f.width(), f.height(), f.format());
-                }
-            }
-        }
+        self.take_frame(ui.ctx());
         if self.exit_after.is_some_and(|d| self.started.elapsed() >= d) {
             println!("source: {}", self.source_line);
             println!("frame: {}", self.frame_line);
@@ -143,6 +289,12 @@ impl eframe::App for App {
                 "frame gap median {:?} ms, convert + upload median {:?} ms",
                 self.arrivals.median(),
                 self.convert.median()
+            );
+            println!(
+                "face in {} of {} frames shown, tracking median {:?} ms",
+                self.with_face,
+                self.shown,
+                self.track.median()
             );
             println!("error: {:?}", self.error);
             self.exit_after = None; // print once; the window takes a frame or two to close
@@ -160,7 +312,7 @@ impl eframe::App for App {
             if let Some(e) = &self.error {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 60, 60),
-                    format!("Stopped: {e}"),
+                    format!("Problem: {e}"),
                 );
             }
             let fps = self.arrivals.median().map(|ms| 1000.0 / ms);
@@ -178,11 +330,22 @@ impl eframe::App for App {
                 self.shown,
                 self.rx.replaced(),
             ));
+            ui.horizontal(|ui| {
+                let mut on = self.tracking_on.load(Ordering::Relaxed);
+                if ui.checkbox(&mut on, "Face tracking").changed() {
+                    self.tracking_on.store(on, Ordering::Relaxed);
+                }
+                ui.checkbox(&mut self.show_points, "Show points");
+                ui.label(self.tracking_line());
+            });
             if let Some(tex) = &self.texture {
                 let avail = ui.available_size();
                 let [w, h] = tex.size();
                 let scale = (avail.x / w as f32).min(avail.y / h as f32).max(0.05);
-                ui.image((tex.id(), egui::vec2(w as f32 * scale, h as f32 * scale)));
+                let shown = ui.image((tex.id(), egui::vec2(w as f32 * scale, h as f32 * scale)));
+                if let (true, Some(face)) = (self.show_points, &self.face) {
+                    draw_points(ui.painter(), shown.rect.min, scale, face);
+                }
             }
         });
     }
@@ -210,15 +373,18 @@ fn main() -> eframe::Result {
     {
         [] => Source::Camera(0),
         ["--pattern"] => Source::Pattern,
+        ["--clip", path] => Source::Clip(path.to_string()),
         ["--camera", n] if n.parse::<u32>().is_ok() => Source::Camera(n.parse().unwrap_or(0)),
         _ => {
-            eprintln!("usage: ec-app [--camera N | --pattern] [--exit-after SECS]");
+            eprintln!(
+                "usage: ec-app [--camera N | --pattern | --clip FILE.y4m] [--exit-after SECS]"
+            );
             std::process::exit(2);
         }
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
+            .with_inner_size([1000.0, 660.0])
             .with_title("Icontact"),
         ..Default::default()
     };
@@ -226,16 +392,30 @@ fn main() -> eframe::Result {
         "Icontact",
         options,
         Box::new(move |cc| {
-            let (tx, rx) = slot();
+            // capture thread -> one-frame slot -> pipeline thread -> one-frame slot -> this window
+            let (frame_tx, frame_rx) = slot();
+            let (tracked_tx, rx) = slot();
             let (status_tx, status) = mpsc::channel();
-            let ctx = cc.egui_ctx.clone();
+            let tracking_on = Arc::new(AtomicBool::new(true));
+
+            let (ctx, status_for_capture) = (cc.egui_ctx.clone(), status_tx.clone());
             thread::Builder::new()
                 .name("capture".into())
-                .spawn(move || capture_loop(source, tx, status_tx, ctx))
+                .spawn(move || capture_loop(source, frame_tx, status_for_capture, ctx))
                 .expect("could not start the capture thread");
+
+            let (ctx, flag) = (cc.egui_ctx.clone(), tracking_on.clone());
+            thread::Builder::new()
+                .name("pipeline".into())
+                .spawn(move || pipeline_loop(frame_rx, tracked_tx, status_tx, flag, ctx))
+                .expect("could not start the pipeline thread");
+
             Ok(Box::new(App {
                 rx,
                 status,
+                tracking_on,
+                show_points: true,
+                face: None,
                 started: Instant::now(),
                 exit_after,
                 texture: None,
@@ -244,8 +424,10 @@ fn main() -> eframe::Result {
                 frame_line: String::new(),
                 convert: Timings::default(),
                 arrivals: Timings::default(),
+                track: Timings::default(),
                 last_arrival: None,
                 shown: 0,
+                with_face: 0,
             }))
         }),
     )
