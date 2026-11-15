@@ -1,5 +1,6 @@
 //! Icontact command-line tool: list cameras, time a camera, benchmark the
-//! pipeline stages (T-025), run the face tracker on a clip, and correct a clip (T-056).
+//! pipeline stages (T-025), run the face tracker on a clip, correct a clip (T-056),
+//! and send or watch frames through the shared block the fake camera reads (T-060).
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use ec_capture::{
 };
 use ec_core::stats::Timings;
 use ec_core::{PixelFormat, Rect};
+use ec_sink::{Fetch, Reader, Writer};
 use ec_vision::{Calibration, FaceTracker, Level, Pipeline};
 
 const USAGE: &str = "\
@@ -25,14 +27,23 @@ ec-cli track --clip FILE.y4m [--frames N] [--threads N] [--raw] [--points FILE.c
     --points writes every frame's 478 points (x,y) as CSV.
 ec-cli correct --clip IN.y4m [--out OUT.y4m] [--stats FILE.csv] [--frames N] [--threads N]
                [--strength 0..1] [--turn UP,RIGHT] [--camera-above DEG] [--slowdown X]
+               [--no-highlight]
     Correct the eyes in a clip and time every stage. --out writes the corrected clip,
     --stats one line per frame (gaze, strength, turn, level).
     --turn asks for a fixed turn in degrees instead of estimating the gaze.
     --camera-above is how far above the screen's middle the camera sits (default 10).
     --slowdown 5 behaves like a processor 5 times slower, to watch the ladder step down.
+    --no-highlight lets the white reflection in the eye be squeezed with the iris, to compare.
 ec-cli eye-dump --clip IN.y4m --frame N --turn UP,RIGHT --out DIR
     Write everything about both eyes of one frame (patch, model answer, before, after)
     as raw files, for training/train/check_app.py to compare with Python.
+ec-cli sink-send --clip IN.y4m [--file PATH] [--frames N] [--fps N]
+    Play a clip into the shared block the fake camera reads, at the clip's speed
+    (the clip repeats). Stands in for the app. --file defaults to the app's own place.
+ec-cli sink-watch [--file PATH] [--seconds N] [--fps N] [--wait MS]
+    Stand in for a fake camera: take the newest frame from the shared block --fps times
+    a second and report what arrived. Run it in a second terminal beside sink-send.
+    --wait 25: if nothing new is there yet, keep looking for up to 25 ms (what a camera should do).
 ec-cli make-clip FILE.y4m [--frames N] [--size WxH]
     Write a generated test clip.";
 
@@ -372,6 +383,8 @@ fn correct(mut a: Args) -> Result<(), String> {
     let camera_above: f32 = a.number("--camera-above", ec_vision::gaze::DEFAULT_CAMERA_ABOVE)?;
     let slowdown: f32 = a.number("--slowdown", 1.0)?;
     let fixed_turn = a.angles("--turn")?;
+    // for comparisons: let the reflection in the eye be squeezed with the iris
+    let no_highlight = a.flag("--no-highlight");
     a.done()?;
 
     let mut source = Y4mSource::open(&clip, false).map_err(|e| e.to_string())?;
@@ -382,6 +395,7 @@ fn correct(mut a: Args) -> Result<(), String> {
     pipeline.slowdown = slowdown;
     pipeline.corrector.settings.strength = strength;
     pipeline.corrector.settings.fixed_turn = fixed_turn;
+    pipeline.corrector.settings.keep_highlight = !no_highlight;
     pipeline.corrector.settings.calibration = Calibration::Assumed { camera_above };
     let mut writer = match &out_path {
         Some(p) => Some(Y4mWriter::create(p, w, h, fps.round() as u32).map_err(|e| e.to_string())?),
@@ -559,6 +573,8 @@ fn eye_dump(mut a: Args) -> Result<(), String> {
     let fps = source.nominal_fps().unwrap_or(30.0);
     let mut pipeline = Pipeline::new(1).map_err(|e| e.to_string())?;
     pipeline.corrector.settings.fixed_turn = Some(turn);
+    // the Python reference (check_app.py) redoes the plain turn only
+    pipeline.corrector.settings.keep_highlight = false;
     for i in 0..=wanted {
         let frame = source
             .next_frame()
@@ -622,6 +638,131 @@ fn make_clip(mut a: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the shared block is: `--file`, or the app's own place.
+fn sink_file(a: &mut Args) -> Result<std::path::PathBuf, String> {
+    Ok(match a.value("--file")? {
+        Some(p) => p.into(),
+        None => ec_sink::default_path(),
+    })
+}
+
+/// Stand in for the app: play a clip into the shared block (T-060).
+fn sink_send(mut a: Args) -> Result<(), String> {
+    let clip = a
+        .value("--clip")?
+        .ok_or("sink-send needs --clip FILE.y4m")?;
+    let file = sink_file(&mut a)?;
+    let frames: usize = a.number("--frames", 300)?;
+    let fps_wanted: f64 = a.number("--fps", 0.0)?;
+    a.done()?;
+
+    let mut source = Y4mSource::open(&clip, true).map_err(|e| e.to_string())?;
+    let fps = if fps_wanted > 0.0 {
+        fps_wanted
+    } else {
+        source.nominal_fps().unwrap_or(30.0)
+    };
+    println!("source: {}", source.describe());
+    let mut writer =
+        Writer::create(&file, ec_sink::layout::DEFAULT_ROOM).map_err(|e| e.to_string())?;
+    println!(
+        "sending {frames} frames at {fps:.0} a second into {}",
+        file.display()
+    );
+    let mut times = Timings::default();
+    let start = Instant::now();
+    for n in 0..frames {
+        let Some(frame) = source.next_frame().map_err(|e| e.to_string())? else {
+            break;
+        };
+        let t = Instant::now();
+        writer.write(&frame).map_err(|e| e.to_string())?;
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        // keep the clip's pace: frame n + 1 is due at (n + 1) / fps
+        let due = start + Duration::from_secs_f64((n + 1) as f64 / fps);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    }
+    println!(
+        "sent {} frames in {:.1} s; putting one frame in: median {:.3} ms, p95 {:.3} ms",
+        times.len(),
+        start.elapsed().as_secs_f64(),
+        times.median().unwrap_or(0.0),
+        times.p95().unwrap_or(0.0)
+    );
+    Ok(())
+}
+
+/// Stand in for a fake camera: take the newest frame at a steady pace (T-060).
+fn sink_watch(mut a: Args) -> Result<(), String> {
+    let file = sink_file(&mut a)?;
+    let seconds: f64 = a.number("--seconds", 5.0)?;
+    let fps: f64 = a.number("--fps", 30.0)?;
+    let wait_ms: u64 = a.number("--wait", 0)?;
+    a.done()?;
+    if fps <= 0.0 || seconds <= 0.0 {
+        return Err("--fps and --seconds must be above 0".into());
+    }
+
+    // The app may not have started yet: a camera would keep trying, so do we.
+    let opened = Instant::now();
+    let mut reader = loop {
+        match Reader::open(&file) {
+            Ok(r) => break r,
+            Err(e) if opened.elapsed() > Duration::from_secs(10) => {
+                return Err(format!("{}: {e}", file.display()))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    println!(
+        "watching {} for {seconds} s, {fps:.0} looks a second",
+        file.display()
+    );
+    let (mut new, mut nothing, mut gone) = (0u64, 0u64, 0u64);
+    let (mut first, mut last) = (0u64, 0u64);
+    let mut kind = String::new();
+    let mut times = Timings::default();
+    let start = Instant::now();
+    let ticks = (seconds * fps).round() as u64;
+    for n in 0..ticks {
+        let t = Instant::now();
+        let fetched = reader
+            .fetch_within(Duration::from_millis(wait_ms))
+            .map_err(|e| e.to_string())?;
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        match fetched {
+            Fetch::New(f) => {
+                times.push(ms);
+                new += 1;
+                if first == 0 {
+                    first = f.seq;
+                }
+                if f.seq <= last {
+                    return Err(format!("frame {} came after frame {last}", f.seq));
+                }
+                last = f.seq;
+                kind = format!("{}x{} {:?}", f.width(), f.height(), f.format());
+            }
+            Fetch::NothingNew => nothing += 1,
+            Fetch::WriterGone => gone += 1,
+        }
+        let due = start + Duration::from_secs_f64((n + 1) as f64 / fps);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    }
+    println!("{ticks} looks: {new} new frames, {nothing} times nothing new, {gone} times the sender was gone");
+    if new > 0 {
+        // frames that went in between our first and last, and that we never took
+        let passed = (last - first + 1) - new;
+        println!("frames {first} to {last} ({kind}); {passed} went by untaken");
+        println!(
+            "taking one frame out (waiting included): median {:.3} ms, p95 {:.3} ms",
+            times.median().unwrap_or(0.0),
+            times.p95().unwrap_or(0.0)
+        );
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -636,6 +777,8 @@ fn main() -> ExitCode {
         "track" => track(Args(args)),
         "correct" => correct(Args(args)),
         "eye-dump" => eye_dump(Args(args)),
+        "sink-send" => sink_send(Args(args)),
+        "sink-watch" => sink_watch(Args(args)),
         "make-clip" => make_clip(Args(args)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

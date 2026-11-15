@@ -11,6 +11,7 @@ use ec_core::{Frame, Rect};
 use crate::eye::{model_input, Eye, EyeBox, EyeCrop, Side};
 use crate::gate::{self, Factors, Fade, GateInput};
 use crate::gaze::{face_reading, Angles, Calibration, GazeEstimator};
+use crate::highlight;
 use crate::redirect;
 use crate::tracker::Face;
 use crate::warp::{Maps, WarpModel, MAX_TURN};
@@ -36,9 +37,12 @@ const STEADY_SHARE: f32 = 0.25;
 const QUICK_CHANGE: f32 = 0.004;
 
 /// Where the strength slider starts. Not 100%: at the full turn the current
-/// eye model (v2) bends the lids and the iris enough to look odd on a live face
-/// (Berkay, 2026-11-15), and 50 to 60% looked clearly better.
-pub const DEFAULT_STRENGTH: f32 = 0.6;
+/// eye model (v2) bends the lids and the iris enough to look odd on a live face.
+/// History (Berkay, live, 2026-11-15): 100% looked weird, so this became 0.6;
+/// 60% looked great but the eye contact was hardly felt, and what spoiled 100%
+/// by then was the shrinking reflection. With the reflection kept whole
+/// (`highlight.rs`) this went up to 0.8.
+pub const DEFAULT_STRENGTH: f32 = 0.8;
 
 /// What the user (or a test) can set.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,6 +53,9 @@ pub struct Settings {
     /// For tests and comparisons: skip the gaze estimate and always ask for this
     /// turn (`[up, right]` in degrees). The rest of the gate still applies.
     pub fixed_turn: Option<Angles>,
+    /// Keep the small white reflection in the eye its own size while the iris
+    /// is turned (see `highlight.rs`). Off only for comparisons.
+    pub keep_highlight: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +64,7 @@ impl Default for Settings {
             strength: DEFAULT_STRENGTH,
             calibration: Calibration::default(),
             fixed_turn: None,
+            keep_highlight: true,
         }
     }
 }
@@ -206,9 +214,9 @@ impl EyeCorrector {
             }
             let t = Instant::now();
             let found = Eye::from_points(&face.points, side)
-                .and_then(|eye| EyeBox::from_eye(&eye))
-                .and_then(|b| EyeCrop::cut(frame, &b).map(|crop| (b, crop)));
-            let Some((eye_box, crop)) = found else {
+                .and_then(|eye| EyeBox::from_eye(&eye).map(|b| (eye, b)))
+                .and_then(|(eye, b)| EyeCrop::cut(frame, &b).map(|crop| (eye, b, crop)));
+            let Some((eye, eye_box, crop)) = found else {
                 self.maps[i] = None;
                 continue;
             };
@@ -242,7 +250,26 @@ impl EyeCorrector {
                 continue;
             };
             let t = Instant::now();
-            report.changed_pixels += redirect::apply(frame, &crop, &eye_box, maps, mirrored)?;
+            // Lift the reflection off a copy of the eye picture, turn the eye
+            // without it, and lay it back whole (the model above saw the eye
+            // as the camera did, reflection and all).
+            let mut bare = None;
+            let mut light = None;
+            if self.settings.keep_highlight {
+                let mut copy = crop.clone();
+                light = highlight::lift(&mut copy, &eye);
+                if light.is_some() {
+                    bare = Some(copy);
+                }
+            }
+            report.changed_pixels += redirect::apply(
+                frame,
+                bare.as_ref().unwrap_or(&crop),
+                &eye_box,
+                maps,
+                mirrored,
+                light.as_ref(),
+            )?;
             report.times.apply_ms += ms_since(t);
 
             if self.keep_debug {

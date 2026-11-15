@@ -31,6 +31,9 @@ cargo test
 - `target/release/ec-cli` lists cameras, times a camera, benchmarks the pipeline
   stages, runs the face tracker over a clip, and corrects a clip (`ec-cli help`).
 
+Not built yet: the fake camera that Zoom and other apps would pick. So far the
+corrected picture is only shown in the app's own window.
+
 ## Licence
 
 Code and model files: MIT or Apache-2.0, at your choice. The two face models come from

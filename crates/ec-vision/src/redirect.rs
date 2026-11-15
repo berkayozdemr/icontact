@@ -16,6 +16,7 @@
 use ec_core::{Frame, FrameError};
 
 use crate::eye::{EyeBox, EyeCrop};
+use crate::highlight::{Highlight, FOLLOW};
 use crate::warp::Maps;
 
 /// Inside this share of the way from the box's middle to its edge the model's
@@ -42,6 +43,10 @@ pub fn mask(u: f32, v: f32) -> f32 {
 /// `crop` is the untouched picture the colours are fetched from. With `mirrored`
 /// the maps were made from the mirror image of the patch (see [`crate::eye::Side`]).
 ///
+/// With a `highlight` (see [`crate::highlight`]), `crop` is the eye with its
+/// reflection already taken out; the reflection is laid back on top here, whole,
+/// moved by part of the iris's move.
+///
 /// Returns how many pixels were changed.
 pub fn apply(
     frame: &mut Frame,
@@ -49,44 +54,66 @@ pub fn apply(
     eye_box: &EyeBox,
     maps: &Maps,
     mirrored: bool,
+    highlight: Option<&Highlight>,
 ) -> Result<usize, FrameError> {
     let rect = crop.rect;
     let (w, h) = (rect.w as usize, rect.h as usize);
     let mut rgb = vec![0u8; w * h * 3];
     let mut alpha = vec![0u8; w * h];
     let mut changed = 0;
+    // What the maps say at a frame position: how far away to fetch the colour
+    // from (in frame pixels, across and down the picture) and how much to brighten.
+    // `None` outside the box.
+    let fetch_at = |x: f32, y: f32| -> Option<(f32, f32, f32)> {
+        let (u, v) = eye_box.to_patch(x, y);
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        let m = mask(u, v);
+        if m <= 0.0 {
+            return None;
+        }
+        // For a mirrored eye, read the map at the mirrored spot, and a fetch
+        // "from the right" in the mirror image is "from the left" here.
+        let [mut fetch_across, fetch_down, bright] = maps.at(if mirrored { 1.0 - u } else { u }, v);
+        if mirrored {
+            fetch_across = -fetch_across;
+        }
+        // The map counts 2.0 as the whole patch; turn that into frame pixels.
+        let (a, d) = (m * fetch_across / 2.0, m * fetch_down / 2.0);
+        Some((
+            a * eye_box.across[0] + d * eye_box.down[0],
+            a * eye_box.across[1] + d * eye_box.down[1],
+            m * bright * 255.0,
+        ))
+    };
+    // The reflection moves as one piece: by FOLLOW of the move the iris makes
+    // where the reflection sits. (Fetching "from over there" moves the picture
+    // the other way, so the layer is fetched from the same side as the iris is.)
+    let light_shift = highlight.and_then(|h| {
+        fetch_at(h.centre[0], h.centre[1]).map(|(dx, dy, _)| (h, dx * FOLLOW, dy * FOLLOW))
+    });
     for row in 0..h {
         for col in 0..w {
             // the middle of this frame pixel
             let x = rect.x as f32 + col as f32 + 0.5;
             let y = rect.y as f32 + row as f32 + 0.5;
-            let (u, v) = eye_box.to_patch(x, y);
-            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            let Some((dx, dy, lift)) = fetch_at(x, y) else {
                 continue;
-            }
-            let m = mask(u, v);
-            if m <= 0.0 {
-                continue;
-            }
-            // For a mirrored eye, read the map at the mirrored spot, and a fetch
-            // "from the right" in the mirror image is "from the left" here.
-            let [mut fetch_across, fetch_down, bright] =
-                maps.at(if mirrored { 1.0 - u } else { u }, v);
-            if mirrored {
-                fetch_across = -fetch_across;
-            }
-            // The map counts 2.0 as the whole patch; turn that into frame pixels.
-            let (a, d) = (m * fetch_across / 2.0, m * fetch_down / 2.0);
-            let dx = a * eye_box.across[0] + d * eye_box.down[0];
-            let dy = a * eye_box.across[1] + d * eye_box.down[1];
-            let lift = m * bright * 255.0;
-            if dx * dx + dy * dy < MIN_SHIFT * MIN_SHIFT && lift.abs() < 0.5 {
+            };
+            // the reflection that belongs here now, and the one that was here
+            let (light, light_before) = match light_shift {
+                Some((h, sx, sy)) => (h.sample(x + sx, y + sy), h.sample(x, y)),
+                None => ([0.0; 3], [0.0; 3]),
+            };
+            let light_moved = (0..3).any(|c| (light[c] - light_before[c]).abs() >= 0.5);
+            if dx * dx + dy * dy < MIN_SHIFT * MIN_SHIFT && lift.abs() < 0.5 && !light_moved {
                 continue;
             }
             let colour = crop.sample(x + dx, y + dy);
             let i = row * w + col;
             for c in 0..3 {
-                rgb[i * 3 + c] = (colour[c] + lift).round().clamp(0.0, 255.0) as u8;
+                rgb[i * 3 + c] = (colour[c] + lift + light[c]).round().clamp(0.0, 255.0) as u8;
             }
             alpha[i] = 255;
             changed += 1;
@@ -160,7 +187,15 @@ mod tests {
             let before = f.data().to_vec();
             let b = tilted_box();
             let crop = EyeCrop::cut(&f, &b).unwrap();
-            let n = apply(&mut f, &crop, &b, &constant_maps(0.0, 0.0, 0.0), false).unwrap();
+            let n = apply(
+                &mut f,
+                &crop,
+                &b,
+                &constant_maps(0.0, 0.0, 0.0),
+                false,
+                None,
+            )
+            .unwrap();
             assert_eq!(n, 0);
             assert_eq!(f.data(), &before[..], "{:?}", f.format());
         }
@@ -173,7 +208,15 @@ mod tests {
             let before = f.to_rgb();
             let b = tilted_box();
             let crop = EyeCrop::cut(&f, &b).unwrap();
-            let n = apply(&mut f, &crop, &b, &constant_maps(0.1, 0.05, 0.0), false).unwrap();
+            let n = apply(
+                &mut f,
+                &crop,
+                &b,
+                &constant_maps(0.1, 0.05, 0.0),
+                false,
+                None,
+            )
+            .unwrap();
             assert!(n > 1000, "{n}");
             let after = f.to_rgb();
             let mut changed_inside = 0;
@@ -212,16 +255,40 @@ mod tests {
         let b = EyeBox::around([73.6, 50.0], [126.4, 50.0]).unwrap();
         let crop = EyeCrop::cut(&f, &b).unwrap();
         // 0.25 of the half-width = 12 frame pixels to the right
-        apply(&mut f, &crop, &b, &constant_maps(0.25, 0.0, 0.0), false).unwrap();
+        apply(
+            &mut f,
+            &crop,
+            &b,
+            &constant_maps(0.25, 0.0, 0.0),
+            false,
+            None,
+        )
+        .unwrap();
         let red_at = |f: &Frame, x: usize, y: usize| f.data()[(y * 200 + x) * 3];
         assert_eq!(red_at(&f, 100, 50), 112);
         // mirrored: the same map means "from the left"
         let mut f2 = Frame::new(w, h, PixelFormat::Rgb24, crop_source(w, h), 0).unwrap();
-        apply(&mut f2, &crop, &b, &constant_maps(0.25, 0.0, 0.0), true).unwrap();
+        apply(
+            &mut f2,
+            &crop,
+            &b,
+            &constant_maps(0.25, 0.0, 0.0),
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(red_at(&f2, 100, 50), 88);
         // brightness is added on top
         let mut f3 = Frame::new(w, h, PixelFormat::Rgb24, crop_source(w, h), 0).unwrap();
-        apply(&mut f3, &crop, &b, &constant_maps(0.0, 0.0, 0.1), false).unwrap();
+        apply(
+            &mut f3,
+            &crop,
+            &b,
+            &constant_maps(0.0, 0.0, 0.1),
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(red_at(&f3, 100, 50), 100 + 26);
     }
 

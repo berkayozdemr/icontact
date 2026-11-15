@@ -1,0 +1,11 @@
+[package]
+name = "ec-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+# Maps a file into memory, the same way on Windows and macOS.
+memmap2 = "0.9"

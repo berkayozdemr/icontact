@@ -19,6 +19,7 @@ pub mod eye;
 pub mod gate;
 pub mod gaze;
 mod geometry;
+pub mod highlight;
 pub mod ladder;
 mod landmarks;
 mod measure;

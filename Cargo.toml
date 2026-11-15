@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ec-core", "crates/ec-capture", "crates/ec-vision", "crates/ec-cli", "crates/ec-app"]
+members = ["crates/ec-core", "crates/ec-capture", "crates/ec-vision", "crates/ec-sink", "crates/ec-cli", "crates/ec-app"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,7 @@ rust-version = "1.92"
 ec-core = { path = "crates/ec-core" }
 ec-capture = { path = "crates/ec-capture" }
 ec-vision = { path = "crates/ec-vision" }
+ec-sink = { path = "crates/ec-sink" }
 
 [profile.release]
 opt-level = 3

@@ -982,12 +982,21 @@ version = "0.0.1"
 dependencies = [
  "ec-capture",
  "ec-core",
+ "ec-sink",
  "ec-vision",
 ]
 
 [[package]]
 name = "ec-core"
 version = "0.0.1"
+
+[[package]]
+name = "ec-sink"
+version = "0.0.1"
+dependencies = [
+ "ec-core",
+ "memmap2",
+]
 
 [[package]]
 name = "ec-vision"
