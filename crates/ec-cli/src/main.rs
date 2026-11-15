@@ -1,5 +1,5 @@
-//! Icontact command-line tool: list cameras, time a camera, and benchmark the
-//! pipeline stages on a clip or a generated picture (T-025).
+//! Icontact command-line tool: list cameras, time a camera, benchmark the
+//! pipeline stages (T-025), run the face tracker on a clip, and correct a clip (T-056).
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use ec_capture::{
 };
 use ec_core::stats::Timings;
 use ec_core::{PixelFormat, Rect};
-use ec_vision::FaceTracker;
+use ec_vision::{Calibration, FaceTracker, Level, Pipeline};
 
 const USAGE: &str = "\
 ec-cli cameras
@@ -23,6 +23,16 @@ ec-cli bench (--clip FILE.y4m | --synthetic nv12|i420|yuyv|rgb|bgr) [--frames N]
 ec-cli track --clip FILE.y4m [--frames N] [--threads N] [--raw] [--points FILE.csv]
     Run the face tracker over a clip and time it. --raw switches smoothing off.
     --points writes every frame's 478 points (x,y) as CSV.
+ec-cli correct --clip IN.y4m [--out OUT.y4m] [--stats FILE.csv] [--frames N] [--threads N]
+               [--strength 0..1] [--turn UP,RIGHT] [--camera-above DEG] [--slowdown X]
+    Correct the eyes in a clip and time every stage. --out writes the corrected clip,
+    --stats one line per frame (gaze, strength, turn, level).
+    --turn asks for a fixed turn in degrees instead of estimating the gaze.
+    --camera-above is how far above the screen's middle the camera sits (default 10).
+    --slowdown 5 behaves like a processor 5 times slower, to watch the ladder step down.
+ec-cli eye-dump --clip IN.y4m --frame N --turn UP,RIGHT --out DIR
+    Write everything about both eyes of one frame (patch, model answer, before, after)
+    as raw files, for training/train/check_app.py to compare with Python.
 ec-cli make-clip FILE.y4m [--frames N] [--size WxH]
     Write a generated test clip.";
 
@@ -73,6 +83,18 @@ impl Args {
                 .ok_or(format!(
                     "--size: \"{v}\" must look like 1280x720, even numbers"
                 )),
+        }
+    }
+
+    /// `--name UP,RIGHT`: two numbers of degrees.
+    fn angles(&mut self, name: &str) -> Result<Option<[f32; 2]>, String> {
+        match self.value(name)? {
+            None => Ok(None),
+            Some(v) => v
+                .split_once(',')
+                .and_then(|(a, b)| Some([a.trim().parse().ok()?, b.trim().parse().ok()?]))
+                .map(Some)
+                .ok_or(format!("{name}: \"{v}\" must look like 8,-3 (up,right)")),
         }
     }
 
@@ -258,7 +280,7 @@ fn bench(mut a: Args) -> Result<(), String> {
     line("two eye-sized regions to RGB", &crops);
     line("all of the above", &total);
     println!("  (checksum {checksum})");
-    println!("face tracking has its own command: ec-cli track\nstages not built yet: gaze, eye correction, composite, fake camera");
+    println!("face tracking and eye correction are timed by: ec-cli track, ec-cli correct\nstage not built yet: fake camera");
     Ok(())
 }
 
@@ -338,6 +360,250 @@ fn track(mut a: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Correct a clip (T-056): every frame through the same [`Pipeline`] the app uses.
+/// Prints where the time went (T-057) and how the gate and the ladder behaved.
+fn correct(mut a: Args) -> Result<(), String> {
+    let clip = a.value("--clip")?.ok_or("correct needs --clip FILE.y4m")?;
+    let out_path = a.value("--out")?;
+    let stats_path = a.value("--stats")?;
+    let frames: usize = a.number("--frames", usize::MAX)?;
+    let threads: usize = a.number("--threads", 1)?;
+    let strength: f32 = a.number("--strength", ec_vision::DEFAULT_STRENGTH)?;
+    let camera_above: f32 = a.number("--camera-above", ec_vision::gaze::DEFAULT_CAMERA_ABOVE)?;
+    let slowdown: f32 = a.number("--slowdown", 1.0)?;
+    let fixed_turn = a.angles("--turn")?;
+    a.done()?;
+
+    let mut source = Y4mSource::open(&clip, false).map_err(|e| e.to_string())?;
+    let fps = source.nominal_fps().unwrap_or(30.0);
+    let (w, h) = source.size();
+    println!("source: {}", source.describe());
+    let mut pipeline = Pipeline::new(threads).map_err(|e| e.to_string())?;
+    pipeline.slowdown = slowdown;
+    pipeline.corrector.settings.strength = strength;
+    pipeline.corrector.settings.fixed_turn = fixed_turn;
+    pipeline.corrector.settings.calibration = Calibration::Assumed { camera_above };
+    let mut writer = match &out_path {
+        Some(p) => Some(Y4mWriter::create(p, w, h, fps.round() as u32).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let mut stats = match &stats_path {
+        Some(p) => {
+            use std::io::Write;
+            let mut f =
+                std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| format!("{p}: {e}"))?);
+            writeln!(f, "frame,face,level,repeated,gaze_up,gaze_right,strength_left,strength_right,turn_up_left,turn_right_left,turn_up_right,turn_right_right,changed_pixels,total_ms").map_err(|e| e.to_string())?;
+            Some(f)
+        }
+        None => None,
+    };
+
+    // one collection of timings per stage
+    let mut t_track = Timings::default();
+    let mut t_gaze = Timings::default();
+    let mut t_cut = Timings::default();
+    let mut t_model = Timings::default();
+    let mut t_apply = Timings::default();
+    let mut t_total = Timings::default();
+    let (mut seen, mut with_face, mut corrected, mut repeated) = (0usize, 0usize, 0usize, 0usize);
+    let mut at_level = [0usize; 4];
+    let mut level_changes = 0usize;
+    let mut last_level = Level::Full;
+    let mut last_strength: Option<[f32; 2]> = None;
+    let mut biggest_jump = 0.0f32;
+    let (mut gaze_up, mut gaze_right, mut turn_size) =
+        (Timings::default(), Timings::default(), Timings::default());
+
+    // in thousandths of the maps' unit, so the numbers are readable
+    let mut map_change = Timings::default();
+    while seen < frames {
+        let Some(frame) = source.next_frame().map_err(|e| e.to_string())? else {
+            break;
+        };
+        let p = pipeline
+            .process(frame, seen as f64 / fps)
+            .map_err(|e| e.to_string())?;
+        at_level[p.level as usize] += 1;
+        level_changes += (p.level != last_level) as usize;
+        last_level = p.level;
+        repeated += p.repeated as usize;
+        with_face += p.face.is_some() as usize;
+        if !p.repeated {
+            t_total.push(p.total_ms);
+            if let Some(ms) = p.track_ms {
+                t_track.push(ms);
+            }
+        }
+        if let Some(c) = &p.correction {
+            corrected += (c.changed_pixels > 0) as usize;
+            t_gaze.push(c.times.gaze_ms);
+            if c.times.model_ms > 0.0 {
+                t_cut.push(c.times.cut_ms);
+                t_model.push(c.times.model_ms);
+            }
+            if c.changed_pixels > 0 {
+                t_apply.push(c.times.apply_ms);
+            }
+            if let Some(g) = c.gaze {
+                gaze_up.push(g[0] as f64);
+                gaze_right.push(g[1] as f64);
+            }
+            turn_size.push(c.turn[0][0].hypot(c.turn[0][1]) as f64);
+            if c.map_change[0] > 0.0 {
+                map_change.push(c.map_change[0] as f64 * 1000.0);
+            }
+            // The gate's promise: the strength never jumps between two frames.
+            if let Some(prev) = last_strength {
+                for (now, before) in c.strength.iter().zip(prev) {
+                    biggest_jump = biggest_jump.max((now - before).abs());
+                }
+            }
+            last_strength = Some(c.strength);
+        } else if !p.repeated {
+            last_strength = None;
+        }
+        if let Some(f) = stats.as_mut() {
+            use std::io::Write;
+            let c = p.correction.unwrap_or_default();
+            let g = c.gaze.unwrap_or([f32::NAN; 2]);
+            writeln!(
+                f,
+                "{seen},{},{},{},{:.2},{:.2},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2},{},{:.3}",
+                p.face.is_some() as u8,
+                p.level as u8,
+                p.repeated as u8,
+                g[0],
+                g[1],
+                c.strength[0],
+                c.strength[1],
+                c.turn[0][0],
+                c.turn[0][1],
+                c.turn[1][0],
+                c.turn[1][1],
+                c.changed_pixels,
+                p.total_ms
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(out) = writer.as_mut() {
+            if p.frame.format() != PixelFormat::I420 {
+                return Err("the clip writer needs I420 frames".into());
+            }
+            out.write_i420(p.frame.data()).map_err(|e| e.to_string())?;
+        }
+        seen += 1;
+    }
+    if let Some(out) = writer {
+        out.finish().map_err(|e| e.to_string())?;
+    }
+
+    println!(
+        "{seen} frames, face in {with_face}, eyes changed in {corrected}, {threads} thread(s), strength {strength}{}:",
+        match fixed_turn {
+            Some(t) => format!(", fixed turn up {:+} right {:+}", t[0], t[1]),
+            None => format!(", camera taken to be {camera_above} degrees above the usual gaze"),
+        }
+    );
+    line("find the face", &t_track);
+    line("gaze + gate", &t_gaze);
+    line("cut both eyes for the model", &t_cut);
+    line("warp model, both eyes", &t_model);
+    line("move pixels + write back", &t_apply);
+    line("whole frame", &t_total);
+    let range = |t: &Timings| match (t.percentile(0.02), t.median(), t.percentile(0.98)) {
+        (Some(a), Some(b), Some(c)) => format!("2% {a:+.1}  median {b:+.1}  98% {c:+.1}"),
+        _ => "-".into(),
+    };
+    println!("  gaze up, degrees from the camera    {}", range(&gaze_up));
+    println!(
+        "  gaze right, degrees                 {}",
+        range(&gaze_right)
+    );
+    println!(
+        "  turn applied, degrees (left eye)    {}",
+        range(&turn_size)
+    );
+    println!(
+        "  eye model answer, change per frame   {}",
+        range(&map_change)
+    );
+    println!(
+        "  biggest strength change between two frames: {biggest_jump:.3} (a fade allows {:.3})",
+        1.0 / fps as f32 / ec_vision::gate::FADE_SECONDS
+    );
+    println!(
+        "  ladder: full {}, tracking every 2nd {}, eye model every 2nd {}, 15 a second {} ({repeated} pictures repeated); level changed {level_changes} times",
+        at_level[0], at_level[1], at_level[2], at_level[3]
+    );
+    if let Some(p) = out_path {
+        println!("corrected clip written to {p}");
+    }
+    if let Some(p) = stats_path {
+        println!("per-frame numbers written to {p}");
+    }
+    Ok(())
+}
+
+/// Write everything about both eyes of one frame as raw files, so a Python
+/// script can redo the same steps and compare (T-051).
+fn eye_dump(mut a: Args) -> Result<(), String> {
+    let clip = a.value("--clip")?.ok_or("eye-dump needs --clip FILE.y4m")?;
+    let wanted: usize = a.number("--frame", 30)?;
+    let turn = a
+        .angles("--turn")?
+        .ok_or("eye-dump needs --turn UP,RIGHT")?;
+    let dir = a.value("--out")?.ok_or("eye-dump needs --out DIR")?;
+    a.done()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+    let mut source = Y4mSource::open(&clip, false).map_err(|e| e.to_string())?;
+    let fps = source.nominal_fps().unwrap_or(30.0);
+    let mut pipeline = Pipeline::new(1).map_err(|e| e.to_string())?;
+    pipeline.corrector.settings.fixed_turn = Some(turn);
+    for i in 0..=wanted {
+        let frame = source
+            .next_frame()
+            .map_err(|e| e.to_string())?
+            .ok_or("the clip is shorter than --frame")?;
+        pipeline.corrector.keep_debug = i == wanted;
+        pipeline
+            .process(frame, i as f64 / fps)
+            .map_err(|e| e.to_string())?;
+    }
+    if pipeline.corrector.debug.is_empty() {
+        return Err(format!(
+            "no eye was corrected in frame {wanted} (no face, or the eyes were shut)"
+        ));
+    }
+    // f32 values as raw little-endian bytes: numpy reads them with np.fromfile(..., "<f4")
+    let floats = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+    for eye in &pipeline.corrector.debug {
+        let name = format!("{dir}/{}", format!("{:?}", eye.side).to_lowercase());
+        let save = |suffix: &str, bytes: &[u8]| {
+            std::fs::write(format!("{name}{suffix}"), bytes)
+                .map_err(|e| format!("{name}{suffix}: {e}"))
+        };
+        let b = &eye.eye_box;
+        save(
+            ".txt",
+            format!(
+                "frame {wanted}\norigin {} {}\nacross {} {}\ndown {} {}\nrect {} {} {} {}\nmodel_turn {} {}\nmirrored {}\n",
+                b.origin[0], b.origin[1], b.across[0], b.across[1], b.down[0], b.down[1],
+                eye.rect.x, eye.rect.y, eye.rect.w, eye.rect.h,
+                eye.model_turn[0], eye.model_turn[1],
+                eye.side.mirrored() as u8
+            )
+            .as_bytes(),
+        )?;
+        save("_before.rgb", &eye.before)?;
+        save("_after.rgb", &eye.after)?;
+        save("_input.f32", &floats(&eye.input))?;
+        save("_flow.f32", &floats(&eye.maps.flow))?;
+        save("_bright.f32", &floats(&eye.maps.bright))?;
+        println!("wrote {name}.txt and five data files");
+    }
+    Ok(())
+}
+
 fn make_clip(mut a: Args) -> Result<(), String> {
     let frames: u64 = a.number("--frames", 60)?;
     let (w, h) = a.size()?;
@@ -368,6 +634,8 @@ fn main() -> ExitCode {
         "capture" => capture(Args(args)),
         "bench" => bench(Args(args)),
         "track" => track(Args(args)),
+        "correct" => correct(Args(args)),
+        "eye-dump" => eye_dump(Args(args)),
         "make-clip" => make_clip(Args(args)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

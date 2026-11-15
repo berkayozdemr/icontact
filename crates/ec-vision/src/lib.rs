@@ -1,23 +1,43 @@
-//! Everything that looks at the picture (spec §3.2, stage 2 so far).
+//! Everything that looks at the picture (spec §3.2, stages 2 to 5).
 //!
-//! [`FaceTracker`] is the way in: give it a frame, get back the 478 face points,
-//! the head angle, how open each eye is and a confidence.
+//! [`Pipeline`] is the way in: give it a frame, get the frame back with the eyes
+//! corrected, plus what was found on the way. Inside it:
 //!
-//! The two models are MediaPipe's face detector and face mesh (Apache-2.0,
-//! see `models/NOTICE.md`), converted to ONNX and built into the executable.
+//! - [`FaceTracker`] finds the 478 face points, the head angle, how open each
+//!   eye is and a confidence (stage 2).
+//! - [`EyeCorrector`] estimates the gaze, asks the gate how strongly to act,
+//!   runs the warp model and writes the turned eyes into the frame (stages 3 to 5).
+//! - [`Ladder`] makes the work cheaper when the machine cannot keep up.
+//!
+//! The face detector and face mesh are MediaPipe's (Apache-2.0); the warp model
+//! is our own, trained in `training/`. All three are ONNX files built into the
+//! executable; see `models/NOTICE.md`.
 
+mod corrector;
 mod detector;
+pub mod eye;
+pub mod gate;
+pub mod gaze;
 mod geometry;
+pub mod ladder;
 mod landmarks;
 mod measure;
+mod pipeline;
+pub mod redirect;
 mod runtime;
 mod smooth;
 mod tracker;
+mod warp;
 
+pub use corrector::{CorrectTimes, Correction, EyeCorrector, EyeDebug, Settings, DEFAULT_STRENGTH};
+pub use gaze::{Angles, Calibration};
 pub use geometry::Roi;
+pub use ladder::{Ladder, Level};
 pub use measure::{eye_openness, head_angles, HeadAngles};
+pub use pipeline::{Pipeline, Processed, FRAME_LIMIT_MS};
 pub use smooth::{OneEuro, PointFilter};
 pub use tracker::{Face, FaceTracker, StageTimes, POINT_COUNT};
+pub use warp::Maps;
 
 /// Named points of the face mesh. "Left" and "right" are sides of the picture,
 /// not of the person: an unmirrored camera shows the person's right eye on the left.
@@ -45,6 +65,8 @@ pub enum VisionError {
     Runtime(String),
     /// A model returned something other than what we built against.
     BadModelOutput(&'static str),
+    /// Reading from or writing into a frame failed.
+    Frame(ec_core::FrameError),
 }
 
 impl std::fmt::Display for VisionError {
@@ -52,6 +74,7 @@ impl std::fmt::Display for VisionError {
         match self {
             VisionError::Runtime(e) => write!(f, "model runner: {e}"),
             VisionError::BadModelOutput(what) => write!(f, "unexpected model output: {what}"),
+            VisionError::Frame(e) => write!(f, "frame: {e}"),
         }
     }
 }
@@ -61,5 +84,11 @@ impl std::error::Error for VisionError {}
 impl<R> From<ort::Error<R>> for VisionError {
     fn from(e: ort::Error<R>) -> Self {
         VisionError::Runtime(e.to_string())
+    }
+}
+
+impl From<ec_core::FrameError> for VisionError {
+    fn from(e: ec_core::FrameError) -> Self {
+        VisionError::Frame(e)
     }
 }

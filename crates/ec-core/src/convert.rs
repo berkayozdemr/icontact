@@ -101,6 +101,130 @@ pub(crate) fn region_to_rgb(frame: &Frame, rect: Rect, out: &mut [u8]) {
     }
 }
 
+/// Mix `rgb` into `rect` of a frame's bytes, in the frame's own format (spec D-6).
+///
+/// `alpha` holds one byte per pixel of `rect`: 0 keeps the frame's pixel, 255
+/// replaces it, values between mix the two. A pixel with alpha 0 is never
+/// written, so everything outside the mask stays bit-for-bit as the camera sent it.
+///
+/// The YUV formats store colour once per block of pixels (2x2, or 2x1 for YUYV).
+/// A block's colour moves by the average pull of its pixels, and a block with
+/// no pulled pixel is left alone.
+///
+/// The caller has checked that `rect` lies inside the frame and that `rgb` and
+/// `alpha` have the right lengths.
+pub(crate) fn blend_region(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    rect: Rect,
+    rgb: &[u8],
+    alpha: &[u8],
+) {
+    let (w, h) = (width as usize, height as usize);
+    let (rx, ry, rw, rh) = (
+        rect.x as usize,
+        rect.y as usize,
+        rect.w as usize,
+        rect.h as usize,
+    );
+    debug_assert_eq!(rgb.len(), rw * rh * 3);
+    debug_assert_eq!(alpha.len(), rw * rh);
+    // old + (new - old) * a / 255, rounded to nearest
+    let mix = |old: u8, new: u8, a: u8| -> u8 {
+        let step = (new as i32 - old as i32) * a as i32;
+        (old as i32 + (step + step.signum() * 127) / 255) as u8
+    };
+
+    if matches!(format, PixelFormat::Rgb24 | PixelFormat::Bgr24) {
+        let swap = format == PixelFormat::Bgr24;
+        for row in 0..rh {
+            for col in 0..rw {
+                let a = alpha[row * rw + col];
+                if a == 0 {
+                    continue;
+                }
+                let src = &rgb[(row * rw + col) * 3..][..3];
+                let dst = &mut data[((ry + row) * w + rx + col) * 3..][..3];
+                for (c, new) in src.iter().enumerate() {
+                    let d = if swap { 2 - c } else { c };
+                    dst[d] = mix(dst[d], *new, a);
+                }
+            }
+        }
+        return;
+    }
+
+    // How many pixels share one colour sample, across and down.
+    let (block_w, block_h) = match format {
+        PixelFormat::Yuyv => (2, 1),
+        _ => (2, 2),
+    };
+    // Where brightness and the two colour bytes of a block live in each layout.
+    let luma_at = |x: usize, y: usize| match format {
+        PixelFormat::Yuyv => (y * w + x) * 2,
+        _ => y * w + x,
+    };
+    let chroma_at = |cx: usize, cy: usize| match format {
+        PixelFormat::Nv12 => {
+            let i = w * h + cy * w + cx * 2;
+            (i, i + 1)
+        }
+        PixelFormat::I420 => {
+            let cw = w / 2;
+            let i = w * h + cy * cw + cx;
+            (i, i + cw * (h / 2))
+        }
+        _ => {
+            let i = (cy * w + cx * 2) * 2;
+            (i + 1, i + 3)
+        }
+    };
+
+    // First pass: brightness per pixel, and for each colour block the summed pull
+    // towards the new colour (alpha times the difference), for U and for V.
+    let (bx0, by0) = (rx / block_w, ry / block_h);
+    let blocks_w = (rx + rw - 1) / block_w - bx0 + 1;
+    let blocks_h = (ry + rh - 1) / block_h - by0 + 1;
+    let mut pull = vec![(0i32, 0i32, false); blocks_w * blocks_h];
+    for row in 0..rh {
+        for col in 0..rw {
+            let a = alpha[row * rw + col];
+            if a == 0 {
+                continue;
+            }
+            let (x, y) = (rx + col, ry + row);
+            let p = (row * rw + col) * 3;
+            let [new_y, new_u, new_v] = rgb_to_yuv(rgb[p], rgb[p + 1], rgb[p + 2]);
+            let li = luma_at(x, y);
+            data[li] = mix(data[li], new_y, a);
+            let (cx, cy) = (x / block_w, y / block_h);
+            let (ui, vi) = chroma_at(cx, cy);
+            let slot = &mut pull[(cy - by0) * blocks_w + (cx - bx0)];
+            slot.0 += (new_u as i32 - data[ui] as i32) * a as i32;
+            slot.1 += (new_v as i32 - data[vi] as i32) * a as i32;
+            slot.2 = true;
+        }
+    }
+    // Second pass: move each touched block's colour by its average pull.
+    let per_block = (block_w * block_h * 255) as i32;
+    let moved = |old: u8, sum: i32| -> u8 {
+        clamp8(old as i32 + (sum + sum.signum() * per_block / 2) / per_block)
+    };
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let (su, sv, touched) = pull[by * blocks_w + bx];
+            if !touched {
+                continue;
+            }
+            let (ui, vi) = chroma_at(bx0 + bx, by0 + by);
+            data[ui] = moved(data[ui], su);
+            data[vi] = moved(data[vi], sv);
+        }
+    }
+}
+
 /// Packed RGB to I420. Each colour sample is the average of its 2x2 block.
 /// `width` and `height` must be even.
 pub fn rgb_to_i420(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -235,6 +359,99 @@ mod tests {
             "round trip drifted by {}",
             max_diff(&a, &rgb)
         );
+    }
+
+    /// The same picture in every layout the pipeline can write into.
+    fn all_layouts(w: u32, h: u32) -> Vec<Frame> {
+        let rgb = smooth_rgb(w as usize, h as usize);
+        let bgr: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect();
+        let i420 = rgb_to_i420(&rgb, w, h);
+        vec![
+            Frame::new(w, h, PixelFormat::I420, i420.clone(), 0).unwrap(),
+            Frame::new(w, h, PixelFormat::Nv12, i420_to_nv12(&i420, w, h), 0).unwrap(),
+            Frame::new(w, h, PixelFormat::Yuyv, i420_to_yuyv(&i420, w, h), 0).unwrap(),
+            Frame::new(w, h, PixelFormat::Rgb24, rgb, 0).unwrap(),
+            Frame::new(w, h, PixelFormat::Bgr24, bgr, 0).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn blending_with_an_empty_mask_changes_no_byte() {
+        let r = Rect {
+            x: 7,
+            y: 5,
+            w: 21,
+            h: 13,
+        };
+        for mut f in all_layouts(64, 48) {
+            let before = f.data().to_vec();
+            f.blend_rgb(r, &vec![255; 21 * 13 * 3], &vec![0; 21 * 13])
+                .unwrap();
+            assert_eq!(f.data(), &before[..], "{:?}", f.format());
+        }
+    }
+
+    #[test]
+    fn blending_paints_inside_the_mask_and_nothing_outside() {
+        // odd offsets and sizes again, so colour blocks are cut by the rectangle's edge
+        let r = Rect {
+            x: 7,
+            y: 5,
+            w: 21,
+            h: 13,
+        };
+        let colour = [200u8, 90, 40];
+        let patch: Vec<u8> = colour.iter().copied().cycle().take(21 * 13 * 3).collect();
+        for mut f in all_layouts(64, 48) {
+            let before = f.to_rgb();
+            f.blend_rgb(r, &patch, &vec![255; 21 * 13]).unwrap();
+            let after = f.to_rgb();
+            for y in 0..48usize {
+                for x in 0..64usize {
+                    let i = (y * 64 + x) * 3;
+                    let inside = (7..28).contains(&x) && (5..18).contains(&y);
+                    // well inside: every pixel of every colour block was painted
+                    let deep = (8..27).contains(&x) && (6..17).contains(&y);
+                    // a colour block reaches at most one pixel past the rectangle
+                    let far = !(6..29).contains(&x) || !(4..19).contains(&y);
+                    if deep {
+                        assert!(
+                            max_diff(&after[i..i + 3], &colour) <= 4,
+                            "{:?} at {x},{y}: {:?}",
+                            f.format(),
+                            &after[i..i + 3]
+                        );
+                    }
+                    if far {
+                        assert_eq!(&after[i..i + 3], &before[i..i + 3], "{:?}", f.format());
+                    }
+                    if !inside && f.format().needs_even_size() {
+                        // brightness is per pixel, so outside the rectangle it must not move at all
+                        let luma = |rgb: &[u8]| rgb_to_yuv(rgb[i], rgb[i + 1], rgb[i + 2])[0];
+                        assert!(luma(&after).abs_diff(luma(&before)) <= 3);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_alpha_lands_half_way() {
+        let mut f = Frame::new(2, 1, PixelFormat::Rgb24, vec![0, 100, 200, 9, 9, 9], 0).unwrap();
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 1,
+        };
+        f.blend_rgb(r, &[100, 100, 0, 50, 50, 50], &[128, 0])
+            .unwrap();
+        assert_eq!(f.data(), &[50, 100, 100, 9, 9, 9]);
     }
 
     #[test]

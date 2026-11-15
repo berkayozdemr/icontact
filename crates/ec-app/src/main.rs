@@ -1,6 +1,7 @@
-//! Icontact app, milestone 2: a window that shows the live camera (T-024) with
-//! the face tracker's points drawn on top (T-036).
-//! No correction, tray icon or fake camera yet.
+//! Icontact app, milestone 4: a window that shows the live camera (T-024) with the
+//! eyes corrected, the face tracker's points drawn on top (T-036), and a read-out
+//! of the gaze and the gate.
+//! No tray icon, calibration screen or fake camera yet.
 //!
 //!     ec-app                 camera 0
 //!     ec-app --camera 1      another camera
@@ -8,7 +9,7 @@
 //!     ec-app --clip F.y4m    a recorded clip, looped, instead of a camera
 //!     --exit-after SECS      print the read-out and close (for smoke tests)
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use ec_capture::{
 };
 use ec_core::stats::Timings;
 use ec_core::{slot, Frame, PixelFormat, SlotReceiver, SlotSender};
-use ec_vision::{points, Face, FaceTracker};
+use ec_vision::{points, Correction, Face, Level, Pipeline};
 use eframe::egui;
 
 enum Source {
@@ -91,27 +92,42 @@ fn capture_loop(
     }
 }
 
-/// What the pipeline thread hands the window: the frame and what was found in it.
-struct Tracked {
-    frame: Frame,
-    face: Option<Face>,
-    /// Time spent tracking this frame, in milliseconds. `None`: tracking was off.
-    track_ms: Option<f64>,
+/// The switches the window sets and the pipeline thread reads for every frame.
+/// Each is one value that two threads may touch without a lock ("atomic").
+struct Controls {
+    tracking: AtomicBool,
+    correcting: AtomicBool,
+    /// The strength slider, 0 to 1. There is no atomic `f32`, so the number's
+    /// 32 bits are kept in an atomic `u32` (`to_bits` / `from_bits`).
+    strength: AtomicU32,
 }
 
-/// Runs on its own thread: takes each frame from the capture thread, finds the face,
-/// and passes both on to the window. The rest of the pipeline will be added here.
+/// What the pipeline thread hands the window: the frame and what was found in it.
+struct Tracked {
+    /// The frame as the camera sent it. Shares its pixels with `frame` unless the eyes were changed.
+    original: Frame,
+    /// The frame after the pipeline.
+    frame: Frame,
+    face: Option<Face>,
+    correction: Option<Correction>,
+    level: Level,
+    /// Time spent on this frame by the whole pipeline, in milliseconds. `None`: tracking was off.
+    pipeline_ms: Option<f64>,
+}
+
+/// Runs on its own thread: takes each frame from the capture thread, runs the
+/// pipeline (find the face, correct the eyes), and passes the result on to the window.
 fn pipeline_loop(
     frames: SlotReceiver<Frame>,
     out: SlotSender<Tracked>,
     status: mpsc::Sender<Status>,
-    tracking_on: Arc<AtomicBool>,
+    controls: Arc<Controls>,
     ctx: egui::Context,
 ) {
-    let mut tracker = match FaceTracker::new(1) {
-        Ok(t) => Some(t),
+    let mut pipeline = match Pipeline::new(1) {
+        Ok(p) => Some(p),
         Err(e) => {
-            let _ = status.send(Status::Failed(format!("face tracking is off: {e}")));
+            let _ = status.send(Status::Failed(format!("eye correction is off: {e}")));
             None
         }
     };
@@ -123,30 +139,36 @@ fn pipeline_loop(
             .captured_at
             .saturating_duration_since(epoch)
             .as_secs_f64();
-        let mut face = None;
-        let mut track_ms = None;
-        if !tracking_on.load(Ordering::Relaxed) {
-            if let Some(t) = tracker.as_mut() {
-                t.reset();
+        let mut tracked = Tracked {
+            original: frame.clone(), // shares the pixels; no copy
+            frame: frame.clone(),
+            face: None,
+            correction: None,
+            level: Level::Full,
+            pipeline_ms: None,
+        };
+        if !controls.tracking.load(Ordering::Relaxed) {
+            if let Some(p) = pipeline.as_mut() {
+                p.reset();
             }
-        } else if let Some(t) = tracker.as_mut() {
-            let started = Instant::now();
-            match t.track(&frame, time) {
-                Ok(found) => {
-                    face = found;
-                    track_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        } else if let Some(p) = pipeline.as_mut() {
+            p.correcting = controls.correcting.load(Ordering::Relaxed);
+            p.corrector.settings.strength =
+                f32::from_bits(controls.strength.load(Ordering::Relaxed));
+            match p.process(frame, time) {
+                Ok(done) => {
+                    tracked.frame = done.frame;
+                    tracked.face = done.face;
+                    tracked.correction = done.correction;
+                    tracked.level = done.level;
+                    tracked.pipeline_ms = (!done.repeated).then_some(done.total_ms);
                 }
                 Err(e) => {
-                    let _ = status.send(Status::Failed(format!("face tracking stopped: {e}")));
-                    tracker = None;
+                    let _ = status.send(Status::Failed(format!("eye correction stopped: {e}")));
+                    pipeline = None;
                 }
             }
         }
-        let tracked = Tracked {
-            frame,
-            face,
-            track_ms,
-        };
         // an Err from the slot means the window is gone
         if out.send(tracked).is_err() {
             return;
@@ -159,9 +181,14 @@ struct App {
     rx: SlotReceiver<Tracked>,
     status: mpsc::Receiver<Status>,
     /// Shared with the pipeline thread, which reads it for every frame.
-    tracking_on: Arc<AtomicBool>,
+    controls: Arc<Controls>,
     show_points: bool,
+    /// Show the camera's own picture instead of the corrected one, to compare.
+    show_original: bool,
     face: Option<Face>,
+    correction: Option<Correction>,
+    level: Level,
+    corrected: u64,
     started: Instant,
     exit_after: Option<Duration>,
     texture: Option<egui::TextureHandle>,
@@ -182,7 +209,11 @@ impl App {
         let Some(tracked) = self.rx.try_recv() else {
             return;
         };
-        let f = tracked.frame;
+        let f = if self.show_original {
+            tracked.original
+        } else {
+            tracked.frame
+        };
         let now = Instant::now();
         if let Some(prev) = self.last_arrival.replace(now) {
             self.arrivals.push((now - prev).as_secs_f64() * 1000.0);
@@ -199,20 +230,23 @@ impl App {
         }
         self.convert.push(t.elapsed().as_secs_f64() * 1000.0);
         self.convert.keep_last(90);
-        if let Some(ms) = tracked.track_ms {
+        if let Some(ms) = tracked.pipeline_ms {
             self.track.push(ms);
             self.track.keep_last(90);
         }
         self.shown += 1;
         self.with_face += tracked.face.is_some() as u64;
+        self.corrected += tracked.correction.is_some_and(|c| c.changed_pixels > 0) as u64;
         self.face = tracked.face;
+        self.correction = tracked.correction;
+        self.level = tracked.level;
         self.frame_line = format!("{}x{} {:?}", f.width(), f.height(), f.format());
     }
 
     fn tracking_line(&self) -> String {
         match (&self.face, self.track.median()) {
             (Some(f), Some(ms)) => format!(
-                "tracking {ms:.1} ms   sure {:.0}%   head: turn {:+.0}°  nod {:+.0}°  tilt {:+.0}°   eyes open {:.2} / {:.2}",
+                "pipeline {ms:.1} ms   sure {:.0}%   head: turn {:+.0}°  nod {:+.0}°  tilt {:+.0}°   eyes open {:.2} / {:.2}",
                 f.confidence * 100.0,
                 f.head.yaw,
                 f.head.pitch,
@@ -220,9 +254,50 @@ impl App {
                 f.eye_open[0],
                 f.eye_open[1],
             ),
-            (None, Some(ms)) => format!("tracking {ms:.1} ms   no face"),
+            (None, Some(ms)) => format!("pipeline {ms:.1} ms   no face"),
             _ => String::new(),
         }
+    }
+
+    /// The gaze and gate read-out (the rest of T-036): where the eyes look, how
+    /// strongly each is corrected, and which reason is holding the correction back.
+    fn correction_line(&self) -> String {
+        let Some(c) = &self.correction else {
+            return String::new();
+        };
+        let gaze = match c.gaze {
+            Some(g) => format!("gaze: up {:+.0}°  right {:+.0}°", g[0], g[1]),
+            None => "gaze: unreadable".into(),
+        };
+        // the gate's factors of the weaker eye, smallest first
+        let weaker = if c.strength[0] <= c.strength[1] { 0 } else { 1 };
+        let f = c.factors[weaker];
+        let mut reasons = [
+            ("far gaze", f.turn),
+            ("sideways glance", f.side),
+            ("head turned", f.head),
+            ("eye closing", f.open),
+            ("unsure", f.sure),
+            ("slider", f.user),
+        ];
+        reasons.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let held = if reasons[0].1 < 0.995 {
+            format!(
+                "   held back by: {} ({:.0}%)",
+                reasons[0].0,
+                reasons[0].1 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{gaze}   strength {:.0}% / {:.0}%   turn: up {:+.0}°  right {:+.0}°{held}   work level: {}",
+            c.strength[0] * 100.0,
+            c.strength[1] * 100.0,
+            c.turn[weaker ^ 1][0],
+            c.turn[weaker ^ 1][1],
+            self.level.name(),
+        )
     }
 }
 
@@ -291,9 +366,10 @@ impl eframe::App for App {
                 self.convert.median()
             );
             println!(
-                "face in {} of {} frames shown, tracking median {:?} ms",
+                "face in {} of {} frames shown, eyes corrected in {}, pipeline median {:?} ms",
                 self.with_face,
                 self.shown,
+                self.corrected,
                 self.track.median()
             );
             println!("error: {:?}", self.error);
@@ -331,13 +407,28 @@ impl eframe::App for App {
                 self.rx.replaced(),
             ));
             ui.horizontal(|ui| {
-                let mut on = self.tracking_on.load(Ordering::Relaxed);
+                let mut on = self.controls.tracking.load(Ordering::Relaxed);
                 if ui.checkbox(&mut on, "Face tracking").changed() {
-                    self.tracking_on.store(on, Ordering::Relaxed);
+                    self.controls.tracking.store(on, Ordering::Relaxed);
                 }
                 ui.checkbox(&mut self.show_points, "Show points");
                 ui.label(self.tracking_line());
             });
+            ui.horizontal(|ui| {
+                let mut on = self.controls.correcting.load(Ordering::Relaxed);
+                if ui.checkbox(&mut on, "Correct eyes").changed() {
+                    self.controls.correcting.store(on, Ordering::Relaxed);
+                }
+                let mut strength = f32::from_bits(self.controls.strength.load(Ordering::Relaxed));
+                let slider = egui::Slider::new(&mut strength, 0.0..=1.0).text("strength");
+                if ui.add(slider).changed() {
+                    self.controls
+                        .strength
+                        .store(strength.to_bits(), Ordering::Relaxed);
+                }
+                ui.checkbox(&mut self.show_original, "Show original");
+            });
+            ui.label(self.correction_line());
             if let Some(tex) = &self.texture {
                 let avail = ui.available_size();
                 let [w, h] = tex.size();
@@ -396,7 +487,11 @@ fn main() -> eframe::Result {
             let (frame_tx, frame_rx) = slot();
             let (tracked_tx, rx) = slot();
             let (status_tx, status) = mpsc::channel();
-            let tracking_on = Arc::new(AtomicBool::new(true));
+            let controls = Arc::new(Controls {
+                tracking: AtomicBool::new(true),
+                correcting: AtomicBool::new(true),
+                strength: AtomicU32::new(ec_vision::DEFAULT_STRENGTH.to_bits()),
+            });
 
             let (ctx, status_for_capture) = (cc.egui_ctx.clone(), status_tx.clone());
             thread::Builder::new()
@@ -404,7 +499,7 @@ fn main() -> eframe::Result {
                 .spawn(move || capture_loop(source, frame_tx, status_for_capture, ctx))
                 .expect("could not start the capture thread");
 
-            let (ctx, flag) = (cc.egui_ctx.clone(), tracking_on.clone());
+            let (ctx, flag) = (cc.egui_ctx.clone(), controls.clone());
             thread::Builder::new()
                 .name("pipeline".into())
                 .spawn(move || pipeline_loop(frame_rx, tracked_tx, status_tx, flag, ctx))
@@ -413,9 +508,13 @@ fn main() -> eframe::Result {
             Ok(Box::new(App {
                 rx,
                 status,
-                tracking_on,
-                show_points: true,
+                controls,
+                show_points: false,
+                show_original: false,
                 face: None,
+                correction: None,
+                level: Level::Full,
+                corrected: 0,
                 started: Instant::now(),
                 exit_after,
                 texture: None,

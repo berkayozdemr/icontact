@@ -155,16 +155,45 @@ impl Frame {
 
     /// One region as packed RGB, `rect.w * rect.h * 3` bytes.
     pub fn crop_rgb(&self, rect: Rect) -> Result<Vec<u8>, FrameError> {
-        let inside = rect.w > 0
-            && rect.h > 0
-            && rect.x.checked_add(rect.w).is_some_and(|r| r <= self.width)
-            && rect.y.checked_add(rect.h).is_some_and(|b| b <= self.height);
-        if !inside {
+        if !self.contains(rect) {
             return Err(FrameError::BadRect(rect));
         }
         let mut out = vec![0u8; (rect.w * rect.h * 3) as usize];
         convert::region_to_rgb(self, rect, &mut out);
         Ok(out)
+    }
+
+    /// Mix an RGB patch into `rect`, writing the frame's own format (spec D-6).
+    ///
+    /// `rgb` is `rect.w * rect.h * 3` bytes and `alpha` one byte per pixel:
+    /// 0 keeps the frame's pixel untouched, 255 replaces it.
+    ///
+    /// The pixels are shared between clones of a frame (`Arc`). `Arc::make_mut`
+    /// gives us our own copy first if anyone else still holds them, so a clone
+    /// kept elsewhere (the "original" for the preview) is never changed.
+    pub fn blend_rgb(&mut self, rect: Rect, rgb: &[u8], alpha: &[u8]) -> Result<(), FrameError> {
+        if !self.contains(rect) {
+            return Err(FrameError::BadRect(rect));
+        }
+        let pixels = (rect.w * rect.h) as usize;
+        if rgb.len() != pixels * 3 || alpha.len() != pixels {
+            return Err(FrameError::BadLength {
+                expected: pixels * 3,
+                got: rgb.len(),
+            });
+        }
+        let (w, h, format) = (self.width, self.height, self.format);
+        let data: &mut Vec<u8> = Arc::make_mut(&mut self.data);
+        convert::blend_region(data, w, h, format, rect, rgb, alpha);
+        Ok(())
+    }
+
+    /// True if `rect` is not empty and lies inside the frame.
+    fn contains(&self, rect: Rect) -> bool {
+        rect.w > 0
+            && rect.h > 0
+            && rect.x.checked_add(rect.w).is_some_and(|r| r <= self.width)
+            && rect.y.checked_add(rect.h).is_some_and(|b| b <= self.height)
     }
 }
 
