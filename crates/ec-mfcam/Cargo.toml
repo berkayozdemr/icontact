@@ -1,0 +1,30 @@
+[package]
+name = "ec-mfcam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The Windows 11 camera. This crate becomes icontact_mfcam.dll, a library that
+# Windows itself loads (inside its camera service) when an app opens the
+# "Icontact Camera". "cdylib" means: build a plain DLL with C-style exports.
+# "rlib" is the normal Rust library form, kept so the tests can use the code.
+[lib]
+name = "icontact_mfcam"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ec-core.workspace = true
+ec-sink.workspace = true
+
+# Only on Windows: Microsoft's own Rust bindings to the Windows interfaces.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+windows-core = "0.62"

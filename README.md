@@ -13,7 +13,7 @@ You look at your screen; the people you talk to see you looking at them.
 | | macOS | Windows |
 |---|---|---|
 | Corrects your eyes in its own window | Yes | Builds and passes its tests; not yet tried on a real camera |
-| Shows up as a camera in meeting apps | Yes, through OBS's camera (see below) | Not yet; in progress |
+| Shows up as a camera in meeting apps | Yes, through OBS's camera (see below) | Windows 11: written, not yet tried on a real machine |
 
 What to expect today:
 
@@ -48,17 +48,27 @@ to be open.
 The app is not signed either. If you copy `Icontact.app` to another Mac, the
 first start there is right-click > Open.
 
-## On Windows
+## On Windows 11: first draft, untested
 
-```bash
-cargo build --release
+Needs Windows 11, Rust (https://rustup.rs) and the Visual Studio C++ build
+tools that Rust asks for. After cloning, in PowerShell in the project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
-`target\release\ec-app.exe` opens a window with your camera and your eyes
-corrected. The Windows build is compiled and tested automatically, but so far
-nobody has recorded running it on a real Windows camera, so expect rough
-edges. Icontact's own camera for meeting apps is being built; until it lands,
-the corrected picture stays in that window.
+It builds the app and Icontact's own camera, and asks once for administrator
+rights to install the camera part. Then start `target\release\ec-app.exe`
+and pick **"Icontact Camera"** in your meeting app.
+
+**This Windows route was written on a Mac and has not been run on a real
+Windows machine yet.** It compiles and its tests pass, nothing more. If you
+try it and the camera does not appear or shows no picture, the file
+`C:\ProgramData\Icontact\mfcam.log` says what the camera part did; please
+open an issue with it. `scripts\uninstall-windows.ps1` removes everything again.
+
+Reading a real Windows webcam is equally untried. Without a webcam,
+`ec-app.exe --pattern` sends a test picture instead.
 
 ## Building and testing by hand
 

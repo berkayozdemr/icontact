@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ec-core", "crates/ec-capture", "crates/ec-vision", "crates/ec-sink", "crates/ec-cli", "crates/ec-app"]
+members = ["crates/ec-core", "crates/ec-capture", "crates/ec-vision", "crates/ec-sink", "crates/ec-mfcam", "crates/ec-cli", "crates/ec-app"]
 resolver = "2"
 
 [workspace.package]

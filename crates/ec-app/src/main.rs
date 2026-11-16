@@ -113,9 +113,19 @@ struct Controls {
     sending: AtomicBool,
 }
 
-/// The way out to meeting apps. On a Mac that is OBS's
-/// installed camera; on other systems nothing is sent yet.
+/// The way out to meeting apps. On a Mac that is OBS's installed camera. On
+/// Windows 11 it is our own "Icontact Camera": the frames go into a shared
+/// block (`ec_sink::Writer`) and the camera library reads them there.
 struct Output {
+    /// Windows: the shared block the finished frames are written into.
+    #[cfg(windows)]
+    writer: Option<ec_sink::Writer>,
+    /// Windows: the camera, switched on. Dropping it takes it off Windows' list.
+    #[cfg(windows)]
+    win_camera: Option<ec_sink::mf_win::WinCamera>,
+    /// Windows: when setting up was last tried, to retry every two seconds only.
+    #[cfg(windows)]
+    win_tried: Option<Instant>,
     #[cfg(target_os = "macos")]
     camera: Option<ec_sink::obs_mac::ObsCamera>,
     /// The size the camera was opened for; a frame of another size reopens it.
@@ -136,6 +146,12 @@ type OutputNews = (String, &'static [&'static str]);
 impl Output {
     fn new() -> Output {
         Output {
+            #[cfg(windows)]
+            writer: None,
+            #[cfg(windows)]
+            win_camera: None,
+            #[cfg(windows)]
+            win_tried: None,
             #[cfg(target_os = "macos")]
             camera: None,
             #[cfg(target_os = "macos")]
@@ -216,7 +232,73 @@ impl Output {
         self.news(line, steps)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Windows: put the frame into the shared block and keep the camera
+    /// switched on. Like the Mac version it never stops the pipeline; a
+    /// problem goes to the window and the next attempt waits two seconds.
+    ///
+    /// Written on a Mac and only compile-checked for Windows.
+    #[cfg(windows)]
+    fn send(&mut self, frame: &Frame, on: bool) -> Option<OutputNews> {
+        use ec_sink::mf_win::{self, WinCamera};
+        use ec_sink::{layout, Writer, WIN_CAMERA_NAME};
+        /// Shown in the window while the one-time install is missing.
+        const INSTALL: &[&str] = &[
+            "Close Icontact.",
+            "In PowerShell, in the project folder, run: powershell -ExecutionPolicy Bypass -File scripts\\install-windows.ps1",
+            "Say yes when Windows asks for administrator rights, then start Icontact again.",
+        ];
+        let mut steps: &'static [&'static str] = &[];
+        let line = if !on {
+            // dropping these removes the camera and marks the block "closed"
+            (self.win_camera, self.writer, self.win_tried) = (None, None, None);
+            "off".to_string()
+        } else if !mf_win::installed() {
+            (self.win_camera, self.writer) = (None, None);
+            steps = INSTALL;
+            "not sending: the camera part is not installed yet".to_string()
+        } else {
+            let may_try = self
+                .win_tried
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+            let mut problem = None;
+            // 1. the shared block
+            if self.writer.is_none() && may_try {
+                self.win_tried = Some(Instant::now());
+                match Writer::create(ec_sink::default_path(), layout::DEFAULT_ROOM) {
+                    Ok(w) => self.writer = Some(w),
+                    Err(e) => problem = Some(format!("the shared block: {e}")),
+                }
+            }
+            // 2. this frame into it
+            if let Some(w) = &mut self.writer {
+                if let Err(e) = w.write(frame) {
+                    problem = Some(format!("writing a frame: {e}"));
+                    self.writer = None;
+                }
+            }
+            // 3. the camera, once the block exists
+            if self.writer.is_some() && self.win_camera.is_none() && may_try {
+                self.win_tried = Some(Instant::now());
+                match WinCamera::start() {
+                    Ok(c) => self.win_camera = Some(c),
+                    Err(e) => problem = Some(e.to_string()),
+                }
+            }
+            match (problem, self.writer.is_some() && self.win_camera.is_some()) {
+                (Some(p), _) => format!("not sending: {p}"),
+                (None, true) => format!(
+                    "sending {}x{} to \"{WIN_CAMERA_NAME}\" (pick that camera in your meeting app)",
+                    frame.width(),
+                    frame.height()
+                ),
+                // between two attempts: keep showing why the last one failed
+                (None, false) => self.line.clone(),
+            }
+        };
+        self.news(line, steps)
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn send(&mut self, _frame: &Frame, _on: bool) -> Option<OutputNews> {
         self.news("not built for this system yet".to_string(), &[])
     }
@@ -578,7 +660,9 @@ impl eframe::App for App {
             // pipeline tries the camera again every two seconds.
             if !self.output_steps.is_empty() {
                 ui.group(|ui| {
-                    ui.label("To send your picture to meeting apps, set OBS's camera up once:");
+                    ui.label(
+                        "To send your picture to meeting apps, one set-up step is needed once:",
+                    );
                     for (n, step) in self.output_steps.iter().enumerate() {
                         ui.label(format!("{}. {step}", n + 1));
                     }

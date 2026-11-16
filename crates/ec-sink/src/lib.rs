@@ -19,6 +19,8 @@
 //! because the Windows 10 camera that reads it is C++, not Rust.
 
 pub mod layout;
+#[cfg(windows)]
+pub mod mf_win;
 #[cfg(target_os = "macos")]
 pub mod obs_mac;
 mod reader;
@@ -71,6 +73,14 @@ impl From<std::io::Error> for SinkError {
         SinkError::Io(e)
     }
 }
+
+/// The class id of the Windows 11 camera, as text with braces. Three places
+/// must agree on it: the camera library (`ec-mfcam`, as a number), the install
+/// script (which writes it into the registry) and the app (which hands it to
+/// Windows to start the camera).
+pub const WIN_CAMERA_CLSID: &str = "{3233B581-9067-4B31-A3F2-C1C07D73BA7E}";
+/// The name meeting apps show for the Windows camera.
+pub const WIN_CAMERA_NAME: &str = "Icontact Camera";
 
 /// Where the shared block lives when nobody says otherwise.
 ///
