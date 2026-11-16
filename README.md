@@ -1,17 +1,70 @@
 # Icontact
 
-Open source eye-contact correction for your webcam, on Windows and macOS.
+Open source eye-contact correction for your webcam, on macOS and Windows.
 You look at your screen; the people you talk to see you looking at them.
 
-**Status: early. It tracks your face and corrects your eyes. On a Mac it sends the corrected picture to meeting apps through OBS's camera; on Windows it cannot yet. Sideways glances still look wrong.**
-
-- Runs on any CPU, no graphics card needed.
-- Everything stays on your machine. No network calls.
+- Runs on the processor alone; no graphics card needed.
+- Everything stays on your machine. The app contains no networking code.
+- Free, and built from this repository with one command. No account, no store.
 - Written in Rust.
 
-The plan is in [planning/TECHNICAL_SPEC.md](planning/TECHNICAL_SPEC.md).
+## Status: early
 
-## Building (milestone 4: eye correction in the preview)
+| | macOS | Windows |
+|---|---|---|
+| Corrects your eyes in its own window | Yes | Builds and passes its tests; not yet tried on a real camera |
+| Shows up as a camera in meeting apps | Yes, through OBS's camera (see below) | Not yet; in progress |
+
+What to expect today:
+
+- **It has been tried by one person on one MacBook.** Other faces, glasses,
+  dim rooms and slow machines are untested. Reports are very welcome.
+- Seen working in Microsoft Teams. Zoom, FaceTime and browsers are not yet checked.
+- It corrects the usual "looking at the screen, a little below the camera"
+  case. When you look well away to the side, it leaves your eyes as they are.
+- There are no downloads yet: you build it yourself (below).
+
+The plan and every measurement so far are in
+[planning/TECHNICAL_SPEC.md](planning/TECHNICAL_SPEC.md) and
+[planning/SPIKE_FINDINGS.md](planning/SPIKE_FINDINGS.md).
+
+## On a Mac: one command
+
+Needs macOS 13.4 or newer, Apple's command line tools (`xcode-select --install`)
+and Rust (https://rustup.rs). After cloning:
+
+```bash
+scripts/setup-mac.sh
+```
+
+It builds `Icontact.app`, sets up the camera that meeting apps will pick, and
+starts the app. Then pick **"OBS Virtual Camera"** as the camera in your
+meeting app.
+
+Why OBS: macOS only lets programs signed with a paid Apple developer account
+add a camera of their own, and this project has no such account. So Icontact
+borrows the camera that the free program [OBS](https://obsproject.com)
+installs. The script offers to install OBS, starts its camera once and closes
+it again. One step is yours: macOS asks you to switch the camera on in System
+Settings, and the script opens that page and waits. After that OBS never has
+to be open.
+
+The app is not signed either. If you copy `Icontact.app` to another Mac, the
+first start there is right-click > Open.
+
+## On Windows
+
+```bash
+cargo build --release
+```
+
+`target\release\ec-app.exe` opens a window with your camera and your eyes
+corrected. The Windows build is compiled and tested automatically, but so far
+nobody has recorded running it on a real Windows camera, so expect rough
+edges. Icontact's own camera for meeting apps is being built; until it lands,
+the corrected picture stays in that window.
+
+## Building and testing by hand
 
 Needs Rust 1.92 or newer. The first build downloads a prebuilt ONNX Runtime
 library (the thing that runs the models), so it needs a network connection once.
@@ -24,24 +77,39 @@ cargo build --release
 cargo test
 ```
 
-- `target/release/ec-app` opens a window with the live camera and the eyes
-  corrected, with a strength slider and a switch to see the original.
-  `--camera N` picks another camera; `--pattern` shows a generated picture and
-  `--clip FILE.y4m` a recorded clip instead.
-- `target/release/ec-cli` lists cameras, times a camera, benchmarks the pipeline
-  stages, runs the face tracker over a clip, and corrects a clip (`ec-cli help`).
+- `target/release/ec-app` opens the window: live camera, eyes corrected, a
+  strength slider, a switch to see the original, and (on a Mac) a "Send to
+  camera" switch. `--camera N` picks another camera; `--pattern` shows a
+  generated picture and `--clip FILE.y4m` a recorded clip instead.
+- `target/release/ec-cli` holds the measuring tools: list cameras, time a
+  camera, time the pipeline stages, correct a recorded clip, check the OBS
+  set-up (`ec-cli help`).
+- `scripts/make-mac-app.sh` builds `target/Icontact.app` without touching the
+  camera set-up.
 
-On a Mac the app also sends the corrected picture to OBS's camera, so meeting
-apps can pick "OBS Virtual Camera". OBS (30 or newer) must be installed and its
-virtual camera started once; the app's window lists the steps still to do,
-and so does `ec-cli obs-check`. Seen working in Microsoft Teams; OBS does not have to be running.
+## Privacy
 
-`scripts/make-mac-app.sh` builds `target/Icontact.app`, an app you can
-double-click. It is not signed with an Apple account, so on another Mac the
-first start is right-click > Open.
-On Windows there is no fake camera yet.
+- Your camera picture is read, changed and handed to the meeting app on your
+  own machine. It is never stored and never sent anywhere by Icontact.
+- The app has no networking code at all, so there is no telemetry, no update
+  check and no account.
+- The models were trained only on computer-rendered eyes, not on photographs
+  of people.
+
+## How it works, briefly
+
+Each camera frame goes through four steps: find the face, find the eyes and
+where they look, ask a small model how to shift the pixels of each eye so it
+looks at the camera, and lay the changed eyes back into the frame. Only the
+eye regions are touched; the rest of the picture is passed through as it came.
+
+[docs/CODE_TOUR.md](docs/CODE_TOUR.md) walks through the code. It is written
+for a .NET engineer learning Rust, so it explains the Rust as it goes. The
+model is made by the Python and Blender code in [training/](training/README.md).
 
 ## Licence
 
-Code and model files: MIT or Apache-2.0, at your choice. The two face models come from
-Google MediaPipe under Apache-2.0; the eye model is our own; see `crates/ec-vision/models/NOTICE.md`.
+Code and the eye model: MIT or Apache-2.0, at your choice. The two face models
+come from Google MediaPipe under Apache-2.0
+(`crates/ec-vision/models/NOTICE.md`). Everything else that is built in is
+listed in [THIRD_PARTY.md](THIRD_PARTY.md).

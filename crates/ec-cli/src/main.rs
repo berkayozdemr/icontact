@@ -46,6 +46,7 @@ ec-cli sink-watch [--file PATH] [--seconds N] [--fps N] [--wait MS]
     --wait 25: if nothing new is there yet, keep looking for up to 25 ms (what a camera should do).
 ec-cli obs-check
     macOS only. Say how far the one-time OBS set-up has got, and list the cameras macOS knows.
+    Ends with exit code 1 while the set-up is unfinished.
 ec-cli obs-send --clip IN.y4m [--frames N] [--correct]
     macOS only. Play a clip into OBS's installed camera at the clip's speed (the clip
     repeats), so that Zoom and others show it as \"OBS Virtual Camera\". OBS need not be
@@ -795,7 +796,13 @@ fn obs_check(a: Args) -> Result<(), String> {
     for c in &cameras {
         println!("  {}  (id {}, {} stream(s))", c.name, c.uid, c.streams);
     }
-    println!("{}", obs_next_steps(ec_sink::obs_mac::obs_state()));
+    // Not ready is reported as a failure (exit code 1), so that
+    // scripts/setup-mac.sh can wait in a loop until the camera appears.
+    let state = ec_sink::obs_mac::obs_state();
+    if state != ec_sink::obs_mac::ObsState::Ready {
+        return Err(obs_next_steps(state));
+    }
+    println!("{}", obs_next_steps(state));
     Ok(())
 }
 

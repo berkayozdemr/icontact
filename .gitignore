@@ -25,3 +25,6 @@ training/logs/
 training/runs/
 # results brought back from a training round (small: model file, scores, sheets)
 !training/results/**/*.onnx
+
+# the owner's own article drafts stay on this machine
+drafts/
