@@ -9,3 +9,12 @@ rust-version.workspace = true
 ec-core.workspace = true
 # Maps a file into memory, the same way on Windows and macOS.
 memmap2 = "0.9"
+
+# Only on Windows: Microsoft's bindings, for starting the Windows 11 camera.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+] }

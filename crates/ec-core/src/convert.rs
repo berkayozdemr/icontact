@@ -356,6 +356,96 @@ pub fn frame_to_uyvy(frame: &Frame, out: &mut [u8]) -> bool {
     true
 }
 
+/// One pixel of any frame as brightness and colour (Y, U, V).
+/// `x` and `y` must be inside the frame.
+fn yuv_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let d = frame.data();
+    let cw = w.div_ceil(2); // width of the half-size colour planes
+    match frame.format() {
+        // full-size brightness, then one U,V pair per 2x2 block
+        PixelFormat::Nv12 => {
+            let c = w * h + (y / 2) * cw * 2 + (x / 2) * 2;
+            [d[y * w + x], d[c], d[c + 1]]
+        }
+        // the same, with U and V in two separate planes
+        PixelFormat::I420 => {
+            let ch = h.div_ceil(2);
+            let c = (y / 2) * cw + x / 2;
+            [d[y * w + x], d[w * h + c], d[w * h + cw * ch + c]]
+        }
+        // Y0 U Y1 V for each pixel pair
+        PixelFormat::Yuyv => {
+            let pair = (y * w + (x & !1)) * 2;
+            [d[(y * w + x) * 2], d[pair + 1], d[pair + 3]]
+        }
+        PixelFormat::Rgb24 => {
+            let i = (y * w + x) * 3;
+            rgb_to_yuv(d[i], d[i + 1], d[i + 2])
+        }
+        PixelFormat::Bgr24 => {
+            let i = (y * w + x) * 3;
+            rgb_to_yuv(d[i + 2], d[i + 1], d[i])
+        }
+    }
+}
+
+/// Any frame to an NV12 picture of a fixed size, written into `out`, which
+/// must hold `out_w * out_h * 3 / 2` bytes. Returns `false` and writes nothing
+/// if the size is odd or `out` has the wrong length.
+///
+/// The Windows fake camera promises meeting apps one size and one layout
+/// before it has seen a frame, so whatever the real camera delivers is fitted
+/// into that here: scaled to fit (keeping its shape, nearest pixel) and
+/// centred, with black bars where the shapes differ. A frame that already is
+/// NV12 of the right size is copied as it is.
+pub fn frame_to_nv12_fit(frame: &Frame, out_w: u32, out_h: u32, out: &mut [u8]) -> bool {
+    let (ow, oh) = (out_w as usize, out_h as usize);
+    if ow == 0 || oh == 0 || ow % 2 != 0 || oh % 2 != 0 || out.len() != ow * oh * 3 / 2 {
+        return false;
+    }
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    if w == 0 || h == 0 {
+        return false;
+    }
+    if frame.format() == PixelFormat::Nv12 && (w, h) == (ow, oh) {
+        out.copy_from_slice(frame.data());
+        return true;
+    }
+    // The biggest size of the frame's shape that fits inside the output,
+    // rounded down to even numbers so colour blocks line up.
+    let (mut fw, mut fh) = if w * oh >= h * ow {
+        (ow, (h * ow / w).max(2))
+    } else {
+        ((w * oh / h).max(2), oh)
+    };
+    fw &= !1;
+    fh &= !1;
+    let (left, top) = (((ow - fw) / 2) & !1, ((oh - fh) / 2) & !1);
+
+    // Black in YUV: brightness 16, colour 128.
+    let (luma, colour) = out.split_at_mut(ow * oh);
+    luma.fill(16);
+    colour.fill(128);
+    for oy in 0..fh {
+        let sy = oy * h / fh;
+        let row = &mut luma[(top + oy) * ow + left..][..fw];
+        for (ox, o) in row.iter_mut().enumerate() {
+            *o = yuv_at(frame, ox * w / fw, sy)[0];
+        }
+    }
+    // One colour pair per 2x2 block, taken from the block's top-left pixel.
+    for oy in (0..fh).step_by(2) {
+        let sy = oy * h / fh;
+        let row = &mut colour[((top + oy) / 2) * ow + left..][..fw];
+        for (ox, o) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let [_, u, v] = yuv_at(frame, (ox * 2) * w / fw, sy);
+            *o = [u, v];
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +702,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nv12_of_the_right_size_is_copied_untouched() {
+        let (w, h) = (32u32, 16u32);
+        let nv12 = i420_to_nv12(&rgb_to_i420(&smooth_rgb(32, 16), w, h), w, h);
+        let f = Frame::new(w, h, PixelFormat::Nv12, nv12.clone(), 0).unwrap();
+        let mut out = vec![0u8; nv12.len()];
+        assert!(frame_to_nv12_fit(&f, w, h, &mut out));
+        assert_eq!(out, nv12);
+    }
+
+    #[test]
+    fn every_format_fits_to_the_same_nv12_picture() {
+        let (w, h) = (32u32, 16u32);
+        let rgb = smooth_rgb(w as usize, h as usize);
+        let i420 = rgb_to_i420(&rgb, w, h);
+        let nv12 = i420_to_nv12(&i420, w, h);
+        let fit = |format, data: Vec<u8>| {
+            let f = Frame::new(w, h, format, data, 0).unwrap();
+            let mut out = vec![0u8; nv12.len()];
+            assert!(frame_to_nv12_fit(&f, w, h, &mut out));
+            out
+        };
+        // Same size, so nothing is scaled. I420 holds the same samples: equal.
+        assert_eq!(fit(PixelFormat::I420, i420.clone()), nv12);
+        // YUYV has colour on every row and RGB on every pixel; here one sample
+        // per block is taken instead of an average, so colour may differ a
+        // little on this smooth picture. Brightness must be exact.
+        let luma = (w * h) as usize;
+        for other in [
+            fit(PixelFormat::Yuyv, i420_to_yuyv(&i420, w, h)),
+            fit(PixelFormat::Rgb24, rgb.clone()),
+        ] {
+            assert_eq!(other[..luma], nv12[..luma]);
+            for (a, b) in other[luma..].iter().zip(&nv12[luma..]) {
+                assert!(a.abs_diff(*b) <= 6, "colour {a} against {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrower_frame_is_centred_between_black_bars() {
+        // a 4:3 frame of one flat colour into a 16:9 output
+        let (w, h) = (8u32, 6u32);
+        let rgb: Vec<u8> = std::iter::repeat_n([200u8, 60, 60], (w * h) as usize)
+            .flatten()
+            .collect();
+        let f = Frame::new(w, h, PixelFormat::Rgb24, rgb, 0).unwrap();
+        let (ow, oh) = (32usize, 18usize);
+        let mut out = vec![0u8; ow * oh * 3 / 2];
+        assert!(frame_to_nv12_fit(&f, ow as u32, oh as u32, &mut out));
+        let [y, u, v] = rgb_to_yuv(200, 60, 60);
+        // 4:3 at height 18 is 24 wide: bars of 4 on each side
+        for row in out[..ow * oh].chunks(ow) {
+            assert!(row[..4].iter().all(|&p| p == 16), "left bar is black");
+            assert!(row[4..28].iter().all(|&p| p == y), "the picture");
+            assert!(row[28..].iter().all(|&p| p == 16), "right bar is black");
+        }
+        let colour_row = &out[ow * oh..][..ow];
+        assert_eq!(colour_row[..4], [128; 4]);
+        assert_eq!(colour_row[4..6], [u, v]);
+    }
+
+    #[test]
+    fn a_wrong_output_size_is_refused() {
+        let f = Frame::new(4, 4, PixelFormat::Rgb24, vec![0; 48], 0).unwrap();
+        assert!(!frame_to_nv12_fit(&f, 5, 4, &mut [0u8; 30])); // odd width
+        assert!(!frame_to_nv12_fit(&f, 4, 4, &mut [0u8; 10])); // wrong length
     }
 }

@@ -992,11 +992,22 @@ name = "ec-core"
 version = "0.0.1"
 
 [[package]]
+name = "ec-mfcam"
+version = "0.0.1"
+dependencies = [
+ "ec-core",
+ "ec-sink",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "ec-sink"
 version = "0.0.1"
 dependencies = [
  "ec-core",
  "memmap2",
+ "windows",
 ]
 
 [[package]]
