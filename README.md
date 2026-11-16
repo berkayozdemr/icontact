@@ -19,8 +19,8 @@ What to expect today:
 
 - **It has been tried by one person, on one MacBook and one Windows 11 PC.**
   Other faces, glasses, dim rooms and slow machines are untested. Reports are very welcome.
-- On the Mac it has been seen working in Microsoft Teams. Zoom, FaceTime and
-  browsers are not yet checked, and on Windows no meeting app is confirmed yet.
+- Seen working in Microsoft Teams on both the Mac and Windows 11. Zoom,
+  FaceTime and browsers are not yet checked.
 - It corrects the usual "looking at the screen, a little below the camera"
   case. When you look well away to the side, it leaves your eyes as they are.
 - There are no downloads yet: you build it yourself (below).
@@ -62,7 +62,8 @@ It builds the app and Icontact's own camera, and asks once for administrator
 rights to install the camera part. Then start `target\release\ec-app.exe`
 and pick **"Icontact Camera"** in your meeting app.
 
-This route is new: it has been seen working on one Windows 11 PC so far.
+This route is new: it has been seen working on one Windows 11 PC so far,
+in Microsoft Teams.
 If the camera does not appear or shows no picture on yours, the file
 `C:\ProgramData\Icontact\mfcam.log` says what the camera part did; please
 open an issue with it. `scripts\uninstall-windows.ps1` removes everything again.
