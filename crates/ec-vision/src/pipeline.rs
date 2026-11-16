@@ -1,5 +1,5 @@
 //! The whole per-frame job in one place: find the face, correct the eyes, and
-//! keep an eye on the clock (spec §3.1).
+//! keep an eye on the clock.
 //!
 //! Both programs use this: `ec-app` on its pipeline thread, `ec-cli correct` in a loop.
 

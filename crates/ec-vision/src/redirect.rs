@@ -1,5 +1,5 @@
 //! Turning the eye in the frame: applies the warp model's answer at the camera's
-//! own sharpness and writes the result back (spec §3.2, stages 4 and 5).
+//! own sharpness and writes the result back.
 //!
 //! The model answers on a small 96 x 64 patch, but nothing is ever pasted back
 //! from that patch. Instead, each camera pixel near the eye asks the model's map

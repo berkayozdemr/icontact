@@ -1,4 +1,4 @@
-//! The gate: how strongly to correct, from 0 (leave the eye alone) to 1 (spec §3.2, T-053).
+//! The gate: how strongly to correct, from 0 (leave the eye alone) to 1.
 //!
 //! Each reason to hold back gives a factor from 0 to 1; the strength is their
 //! product. The product then moves through a [`Fade`], so a change is spread
@@ -17,7 +17,7 @@ const TURN_FULL: f32 = 15.0;
 const TURN_ZERO: f32 = 30.0;
 /// The sideways part of the turn has tighter limits of its own. The current eye
 /// model (v2) smears the iris on sideways turns of about 10 degrees and more
-/// (seen on real recordings, SPIKE_FINDINGS §11), so a sideways glance is let
+/// (seen on real recordings), so a sideways glance is let
 /// through as a glance. Raise these when a model handles sideways turns better.
 const SIDE_FULL: f32 = 5.0;
 const SIDE_ZERO: f32 = 12.0;

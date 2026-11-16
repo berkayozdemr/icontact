@@ -1,4 +1,4 @@
-//! macOS output: pushing frames into OBS's installed camera (spec D-9, T-070).
+//! macOS output: pushing frames into OBS's installed camera.
 //!
 //! A Mac camera of our own would need a paid Apple developer account. OBS
 //! already ships one ("OBS Virtual Camera"), and macOS lets any program hand

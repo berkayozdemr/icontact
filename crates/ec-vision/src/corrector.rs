@@ -1,4 +1,4 @@
-//! Corrects both eyes of one tracked face in one frame (spec §3.2, stages 3 to 5).
+//! Corrects both eyes of one tracked face in one frame.
 //!
 //! [`EyeCorrector::correct`] is the whole job in order: estimate the gaze, ask
 //! the gate how strongly to act, run the warp model for each eye, and write the

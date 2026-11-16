@@ -1,30 +1,9 @@
 target/
-.venv/
-__pycache__/
-*.pyc
 .DS_Store
-.claude/
-# downloaded model files and recordings stay out of git
-spike/models/
-spike/samples/
-spike/out/
-spike/rust-tests/target/
+# recordings and loose model files stay out of git
 *.y4m
 *.onnx
 *.tflite
 *.task
-spike/third_party/
-# the two face models are small, Apache-2.0, and built into the executable
+# the three models the app is built with are small and belong to it
 !crates/ec-vision/models/*.onnx
-
-# training: downloaded assets, rendered data and scratch output stay out of git
-training/assets/
-training/data/
-training/out/
-training/logs/
-training/runs/
-# results brought back from a training round (small: model file, scores, sheets)
-!training/results/**/*.onnx
-
-# the owner's own article drafts stay on this machine
-drafts/

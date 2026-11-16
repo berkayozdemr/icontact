@@ -1,4 +1,4 @@
-//! A video frame that stays in the format the camera delivered (spec D-6).
+//! A video frame that stays in the format the camera delivered.
 //!
 //! Converting a whole 1280x720 frame to RGB and back costs more than the eye
 //! correction itself, so the pipeline only converts the small regions it needs
@@ -163,7 +163,7 @@ impl Frame {
         Ok(out)
     }
 
-    /// Mix an RGB patch into `rect`, writing the frame's own format (spec D-6).
+    /// Mix an RGB patch into `rect`, writing the frame's own format.
     ///
     /// `rgb` is `rect.w * rect.h * 3` bytes and `alpha` one byte per pixel:
     /// 0 keeps the frame's pixel untouched, 255 replaces it.

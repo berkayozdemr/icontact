@@ -1,6 +1,6 @@
 //! The warp model: given an eye patch and a turn, says how to move its pixels.
 //!
-//! The model is ours, trained in `training/` on rendered eyes (spec §5), and
+//! The model is ours, and
 //! built into the executable like the two face models.
 
 use ort::session::Session;
@@ -11,7 +11,7 @@ use crate::{runtime, VisionError};
 
 const MODEL: &[u8] = include_bytes!("../models/warp.onnx");
 const PLANE: usize = PATCH_W * PATCH_H;
-/// The model was trained on turns up to about this many degrees.
+/// The model handles turns up to about this many degrees.
 pub const MAX_TURN: f32 = 30.0;
 
 /// What the model answers for one eye, as 64 rows x 96 columns per plane.

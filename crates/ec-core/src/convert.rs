@@ -101,7 +101,7 @@ pub(crate) fn region_to_rgb(frame: &Frame, rect: Rect, out: &mut [u8]) {
     }
 }
 
-/// Mix `rgb` into `rect` of a frame's bytes, in the frame's own format (spec D-6).
+/// Mix `rgb` into `rect` of a frame's bytes, in the frame's own format.
 ///
 /// `alpha` holds one byte per pixel of `rect`: 0 keeps the frame's pixel, 255
 /// replaces it, values between mix the two. A pixel with alpha 0 is never

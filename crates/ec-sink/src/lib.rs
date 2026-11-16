@@ -1,4 +1,4 @@
-//! The hand-over point between the app and the fake camera (spec D-10, T-060).
+//! The hand-over point between the app and the fake camera.
 //!
 //! The fake camera does not live in our app. On Windows it is a small piece of
 //! code that Windows (or Zoom, Teams, a browser) loads into *its own* process.

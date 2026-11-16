@@ -1,6 +1,6 @@
 //! One eye: where it is in the frame, and the level patch the warp model looks at.
 //!
-//! The warp model was trained on a fixed framing (see `training/render/make_dataset.py`):
+//! The warp model expects a fixed framing:
 //! a 96 x 64 patch centred between the two eye corners, level with them, and
 //! 1 / 0.55 times as wide as the distance between them. [`EyeBox`] is that
 //! rectangle placed on the camera frame; everything else here cuts pixels out of it.
@@ -12,7 +12,7 @@ use crate::points;
 /// The size of the picture the warp model sees.
 pub const PATCH_W: usize = 96;
 pub const PATCH_H: usize = 64;
-/// Eye-corner distance over patch width. Must equal `CORNER_SHARE` in the training code.
+/// Eye-corner distance over patch width. The model was made for exactly this share.
 const CORNER_SHARE: f32 = 0.55;
 /// Corners closer than this (in frame pixels) make an eye too small to be worth correcting.
 const MIN_CORNER_DISTANCE: f32 = 10.0;
@@ -206,7 +206,7 @@ impl EyeBox {
 }
 
 /// The part of the frame under an eye box, as RGB. Only this region is ever
-/// converted from the camera's format (spec D-6).
+/// converted from the camera's format.
 #[derive(Clone, Debug)]
 pub struct EyeCrop {
     pub rect: Rect,
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn the_box_is_centred_level_and_as_wide_as_training_made_it() {
+    fn the_box_is_centred_level_and_as_wide_as_the_model_expects() {
         let b = EyeBox::around([100.0, 50.0], [155.0, 50.0]).unwrap();
         // corners 55 apart -> 100 wide, and 3:2
         assert!(close(b.width(), 100.0));

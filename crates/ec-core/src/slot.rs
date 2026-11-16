@@ -1,4 +1,4 @@
-//! A hand-off between two threads with room for exactly one value (spec §3.3).
+//! A hand-off between two threads with room for exactly one value.
 //!
 //! A newer value replaces an unread older one, so nothing ever queues and delay
 //! cannot build up: a slow reader skips frames instead of falling behind.

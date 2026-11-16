@@ -27,7 +27,7 @@ fn environment() -> Result<&'static Environment, VisionError> {
 pub(crate) fn load(model: &[u8], threads: usize) -> Result<Session, VisionError> {
     let session = Session::builder(environment()?)?
         // R1 is "any CPU". Left alone, this version of `ort` picks CoreML on a Mac
-        // (SPIKE_FINDINGS §6b), which no Windows laptop has.
+        //, which no Windows laptop has.
         .with_auto_device(AutoDevicePolicy::PreferCPU)?
         .with_intra_threads(threads.max(1))?
         .commit_from_memory(model)?;

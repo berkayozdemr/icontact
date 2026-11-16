@@ -53,7 +53,7 @@ impl Roi {
 /// Cut `roi` out of `frame` as `size` x `size` RGB floats, each `value * scale + offset`.
 /// Parts of the square that fall outside the frame are black.
 ///
-/// Only the part of the frame under the square is converted to RGB (spec D-6).
+/// Only the part of the frame under the square is converted to RGB.
 pub(crate) fn cut_square(
     frame: &Frame,
     roi: &Roi,

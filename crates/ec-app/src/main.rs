@@ -113,7 +113,7 @@ struct Controls {
     sending: AtomicBool,
 }
 
-/// The way out to meeting apps (spec stage 6b). On a Mac that is OBS's
+/// The way out to meeting apps. On a Mac that is OBS's
 /// installed camera; on other systems nothing is sent yet.
 struct Output {
     #[cfg(target_os = "macos")]

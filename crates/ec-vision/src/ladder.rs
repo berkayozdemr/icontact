@@ -1,5 +1,5 @@
 //! The step-down ladder: what to give up, in what order, when the machine is too
-//! slow (spec §3.3, T-055).
+//! slow.
 //!
 //! The rule that matters: the ladder never switches the correction itself on
 //! and off, because that flickers. It only makes the work cheaper.

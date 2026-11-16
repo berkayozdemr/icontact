@@ -1,4 +1,4 @@
-//! Everything that looks at the picture (spec §3.2, stages 2 to 5).
+//! Everything that looks at the picture.
 //!
 //! [`Pipeline`] is the way in: give it a frame, get the frame back with the eyes
 //! corrected, plus what was found on the way. Inside it:
@@ -10,7 +10,7 @@
 //! - [`Ladder`] makes the work cheaper when the machine cannot keep up.
 //!
 //! The face detector and face mesh are MediaPipe's (Apache-2.0); the warp model
-//! is our own, trained in `training/`. All three are ONNX files built into the
+//! is our own. All three are ONNX files built into the
 //! executable; see `models/NOTICE.md`.
 
 mod corrector;

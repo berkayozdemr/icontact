@@ -24,10 +24,6 @@ What to expect today:
   case. When you look well away to the side, it leaves your eyes as they are.
 - There are no downloads yet: you build it yourself (below).
 
-The plan and every measurement so far are in
-[planning/TECHNICAL_SPEC.md](planning/TECHNICAL_SPEC.md) and
-[planning/SPIKE_FINDINGS.md](planning/SPIKE_FINDINGS.md).
-
 ## On a Mac: one command
 
 Needs macOS 13.4 or newer, Apple's command line tools (`xcode-select --install`)
@@ -93,8 +89,6 @@ cargo test
   own machine. It is never stored and never sent anywhere by Icontact.
 - The app has no networking code at all, so there is no telemetry, no update
   check and no account.
-- The models were trained only on computer-rendered eyes, not on photographs
-  of people.
 
 ## How it works, briefly
 
@@ -103,13 +97,10 @@ where they look, ask a small model how to shift the pixels of each eye so it
 looks at the camera, and lay the changed eyes back into the frame. Only the
 eye regions are touched; the rest of the picture is passed through as it came.
 
-[docs/CODE_TOUR.md](docs/CODE_TOUR.md) walks through the code. It is written
-for a .NET engineer learning Rust, so it explains the Rust as it goes. The
-model is made by the Python and Blender code in [training/](training/README.md).
+The code is commented in plain language throughout.
 
 ## Licence
 
 Code and the eye model: MIT or Apache-2.0, at your choice. The two face models
 come from Google MediaPipe under Apache-2.0
-(`crates/ec-vision/models/NOTICE.md`). Everything else that is built in is
-listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+(`crates/ec-vision/models/NOTICE.md`).

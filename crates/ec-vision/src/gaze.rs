@@ -1,4 +1,4 @@
-//! Where the eyes are looking, compared with the camera (spec §3.2 stage 3, T-052).
+//! Where the eyes are looking, compared with the camera.
 //!
 //! All angles here are a pair of degrees, `[up, right]`: up is positive, and
 //! "right" means towards the right of the picture. The warp model's turn uses

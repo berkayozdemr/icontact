@@ -1,4 +1,4 @@
-//! Follows one face from frame to frame (spec §3.2, stage 2).
+//! Follows one face from frame to frame.
 //!
 //! Detect once, then track: while a face is being followed, the square for the
 //! next frame comes from this frame's points, and only the mesh model runs.
@@ -23,7 +23,7 @@ const MIN_FACE_SCORE: f32 = 0.5;
 /// points already shimmer by only 0.1 to 0.2 px on a 355 px face, and points that trail
 /// the picture would put the eye correction in the wrong place. Measured on two
 /// recordings, these roughly halve the shimmer for about 1 px of lag at worst
-/// (SPIKE_FINDINGS §9). T-064 tunes them again with the gate.
+///. T-064 tunes them again with the gate.
 const SMOOTH_MIN_CUTOFF: f32 = 3.0;
 const SMOOTH_BETA: f32 = 300.0;
 

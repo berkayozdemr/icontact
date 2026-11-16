@@ -36,7 +36,7 @@ ec-cli correct --clip IN.y4m [--out OUT.y4m] [--stats FILE.csv] [--frames N] [--
     --no-highlight lets the white reflection in the eye be squeezed with the iris, to compare.
 ec-cli eye-dump --clip IN.y4m --frame N --turn UP,RIGHT --out DIR
     Write everything about both eyes of one frame (patch, model answer, before, after)
-    as raw files, for training/train/check_app.py to compare with Python.
+    as raw files, to compare the app's arithmetic with another implementation.
 ec-cli sink-send --clip IN.y4m [--file PATH] [--frames N] [--fps N]
     Play a clip into the shared block the fake camera reads, at the clip's speed
     (the clip repeats). Stands in for the app. --file defaults to the app's own place.
