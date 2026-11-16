@@ -236,7 +236,7 @@ impl Output {
     /// switched on. Like the Mac version it never stops the pipeline; a
     /// problem goes to the window and the next attempt waits two seconds.
     ///
-    /// Written on a Mac and only compile-checked for Windows.
+    /// Written on a Mac; reported working on one Windows 11 PC (2026-11-16).
     #[cfg(windows)]
     fn send(&mut self, frame: &Frame, on: bool) -> Option<OutputNews> {
         use ec_sink::mf_win::{self, WinCamera};

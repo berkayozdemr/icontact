@@ -11,9 +11,8 @@
 //! - `log.rs`: a small log file, because this code runs inside a Windows
 //!   service where nothing can be printed.
 //!
-//! WRITTEN ON A MAC AND ONLY COMPILE-CHECKED FOR WINDOWS. Until someone has
-//! seen it work on a Windows 11 machine, treat every line of `com.rs` as a
-//! first draft.
+//! Written on a Mac; reported working on one Windows 11 PC (2026-11-16). It is still
+//! young: one machine, one test picture.
 
 pub mod feed;
 pub mod log;

@@ -20,7 +20,7 @@
 //! the open source VCamSample project; the comments say where a value was
 //! taken from them rather than understood.
 //!
-//! NOT RUN YET. Written on a Mac and compile-checked only.
+//! Written on a Mac; reported working on one Windows 11 PC (2026-11-16).
 
 #![allow(non_snake_case)] // the method names are Windows' own
 

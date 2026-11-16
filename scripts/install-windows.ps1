@@ -17,8 +17,7 @@
 #
 # Undo everything with scripts\uninstall-windows.ps1.
 #
-# NOT YET RUN ON A REAL MACHINE: written on a Mac. If a step fails, the
-# message says which one.
+# If a step fails, the message says which one.
 
 param(
     # Set by the script itself when it starts its administrator half.

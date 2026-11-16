@@ -12,14 +12,15 @@ You look at your screen; the people you talk to see you looking at them.
 
 | | macOS | Windows |
 |---|---|---|
-| Corrects your eyes in its own window | Yes | Builds and passes its tests; not yet tried on a real camera |
-| Shows up as a camera in meeting apps | Yes, through OBS's camera (see below) | Windows 11: written, not yet tried on a real machine |
+| Corrects your eyes in its own window | Yes | Runs; not yet tried with a real webcam |
+| Shows up as a camera in meeting apps | Yes, through OBS's camera (see below) | Yes on Windows 11, with its own camera (new) |
 
 What to expect today:
 
-- **It has been tried by one person on one MacBook.** Other faces, glasses,
-  dim rooms and slow machines are untested. Reports are very welcome.
-- Seen working in Microsoft Teams. Zoom, FaceTime and browsers are not yet checked.
+- **It has been tried by one person, on one MacBook and one Windows 11 PC.**
+  Other faces, glasses, dim rooms and slow machines are untested. Reports are very welcome.
+- On the Mac it has been seen working in Microsoft Teams. Zoom, FaceTime and
+  browsers are not yet checked, and on Windows no meeting app is confirmed yet.
 - It corrects the usual "looking at the screen, a little below the camera"
   case. When you look well away to the side, it leaves your eyes as they are.
 - There are no downloads yet: you build it yourself (below).
@@ -48,7 +49,7 @@ to be open.
 The app is not signed either. If you copy `Icontact.app` to another Mac, the
 first start there is right-click > Open.
 
-## On Windows 11: first draft, untested
+## On Windows 11: one command
 
 Needs Windows 11, Rust (https://rustup.rs) and the Visual Studio C++ build
 tools that Rust asks for. After cloning, in PowerShell in the project folder:
@@ -61,14 +62,14 @@ It builds the app and Icontact's own camera, and asks once for administrator
 rights to install the camera part. Then start `target\release\ec-app.exe`
 and pick **"Icontact Camera"** in your meeting app.
 
-**This Windows route was written on a Mac and has not been run on a real
-Windows machine yet.** It compiles and its tests pass, nothing more. If you
-try it and the camera does not appear or shows no picture, the file
+This route is new: it has been seen working on one Windows 11 PC so far.
+If the camera does not appear or shows no picture on yours, the file
 `C:\ProgramData\Icontact\mfcam.log` says what the camera part did; please
 open an issue with it. `scripts\uninstall-windows.ps1` removes everything again.
 
-Reading a real Windows webcam is equally untried. Without a webcam,
-`ec-app.exe --pattern` sends a test picture instead.
+Not yet tried: reading a real Windows webcam (the test PC has none; without
+one, `ec-app.exe --pattern` sends a test picture), and Windows 10, which
+needs a different kind of camera that is not written yet.
 
 ## Building and testing by hand
 

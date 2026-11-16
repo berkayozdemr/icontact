@@ -12,7 +12,7 @@
 //! The pictures do not go through here. The app writes them into the shared
 //! block ([`crate::Writer`]) and the library reads them there.
 //!
-//! WRITTEN ON A MAC AND ONLY COMPILE-CHECKED FOR WINDOWS. Not yet run.
+//! Written on a Mac; reported working on one Windows 11 PC (2026-11-16).
 
 use std::ffi::c_void;
 use std::path::PathBuf;
