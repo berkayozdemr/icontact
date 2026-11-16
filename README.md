@@ -3,7 +3,7 @@
 Open source eye-contact correction for your webcam, on Windows and macOS.
 You look at your screen; the people you talk to see you looking at them.
 
-**Status: early. It tracks your face and corrects your eyes in its own window. It cannot yet send the picture to a meeting app, and sideways glances still look wrong.**
+**Status: early. It tracks your face and corrects your eyes. On a Mac it sends the corrected picture to meeting apps through OBS's camera; on Windows it cannot yet. Sideways glances still look wrong.**
 
 - Runs on any CPU, no graphics card needed.
 - Everything stays on your machine. No network calls.
@@ -31,8 +31,15 @@ cargo test
 - `target/release/ec-cli` lists cameras, times a camera, benchmarks the pipeline
   stages, runs the face tracker over a clip, and corrects a clip (`ec-cli help`).
 
-Not built yet: the fake camera that Zoom and other apps would pick. So far the
-corrected picture is only shown in the app's own window.
+On a Mac the app also sends the corrected picture to OBS's camera, so meeting
+apps can pick "OBS Virtual Camera". OBS (30 or newer) must be installed and its
+virtual camera started once; the app's window lists the steps still to do,
+and so does `ec-cli obs-check`. Seen working in Microsoft Teams; OBS does not have to be running.
+
+`scripts/make-mac-app.sh` builds `target/Icontact.app`, an app you can
+double-click. It is not signed with an Apple account, so on another Mac the
+first start is right-click > Open.
+On Windows there is no fake camera yet.
 
 ## Licence
 

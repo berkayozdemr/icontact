@@ -49,6 +49,28 @@ pub fn list_cameras() -> Result<Vec<CameraDescription>, CaptureError> {
         .collect())
 }
 
+/// Is this a fake camera that programs feed, not a real one? Icontact must
+/// never read from these by default: OBS's camera is where our own picture
+/// goes out, so reading it would mean watching our own output (and when
+/// nothing feeds it, it offers a layout we cannot read at all).
+///
+/// Judged by name, because that is all the camera list gives us. Seen on a
+/// Mac the day after OBS was set up: OBS's camera had become number 0 and the
+/// app failed to start (2026-11-16).
+pub fn is_fake_camera(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name.contains("virtual") || name.contains("icontact")
+}
+
+/// The camera to use when the user named none: the first real one in the
+/// list. `None` if the list has only fake cameras or is empty.
+pub fn pick_real_camera(cameras: &[CameraDescription]) -> Option<u32> {
+    cameras
+        .iter()
+        .find(|c| !is_fake_camera(&c.name))
+        .map(|c| c.index)
+}
+
 pub struct CameraSource {
     camera: Camera,
     seq: u64,
@@ -109,6 +131,14 @@ impl CameraSource {
 }
 
 impl CameraSource {
+    /// Open the first real camera (see [`pick_real_camera`]).
+    pub fn open_default(width: u32, height: u32, fps: u32) -> Result<CameraSource, CaptureError> {
+        let index = pick_real_camera(&list_cameras()?).ok_or_else(|| {
+            CaptureError::NoCamera("no camera found (fake cameras are not counted)".into())
+        })?;
+        CameraSource::open(index, width, height, fps)
+    }
+
     /// Every mode the camera offers, as text, for diagnosis.
     pub fn offered_formats(&mut self) -> Vec<String> {
         let mut v: Vec<String> = self
@@ -176,5 +206,34 @@ impl FrameSource for CameraSource {
 impl Drop for CameraSource {
     fn drop(&mut self) {
         let _ = self.camera.stop_stream();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cam(index: u32, name: &str) -> CameraDescription {
+        CameraDescription {
+            index,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn the_default_camera_is_the_first_real_one() {
+        // the order seen on the MacBook once OBS's camera existed
+        let list = [
+            cam(0, "OBS Virtual Camera"),
+            cam(1, "MacBook Pro Camera"),
+            cam(2, "iPhone Desk View Camera"),
+        ];
+        assert_eq!(pick_real_camera(&list), Some(1));
+    }
+
+    #[test]
+    fn only_fake_cameras_means_no_default() {
+        assert_eq!(pick_real_camera(&[cam(0, "OBS Virtual Camera")]), None);
+        assert_eq!(pick_real_camera(&[]), None);
     }
 }

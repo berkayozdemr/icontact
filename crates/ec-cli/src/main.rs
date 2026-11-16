@@ -44,6 +44,16 @@ ec-cli sink-watch [--file PATH] [--seconds N] [--fps N] [--wait MS]
     Stand in for a fake camera: take the newest frame from the shared block --fps times
     a second and report what arrived. Run it in a second terminal beside sink-send.
     --wait 25: if nothing new is there yet, keep looking for up to 25 ms (what a camera should do).
+ec-cli obs-check
+    macOS only. Say how far the one-time OBS set-up has got, and list the cameras macOS knows.
+ec-cli obs-send --clip IN.y4m [--frames N] [--correct]
+    macOS only. Play a clip into OBS's installed camera at the clip's speed (the clip
+    repeats), so that Zoom and others show it as \"OBS Virtual Camera\". OBS need not be
+    running. --correct runs the eye correction on the way.
+ec-cli obs-delay [--seconds N]
+    macOS only. Send numbered test pictures into OBS's camera and read them back from it
+    the way a meeting app would, to measure the delay the camera adds and count lost
+    pictures (T-071). Needs camera permission, so run it from your own terminal.
 ec-cli make-clip FILE.y4m [--frames N] [--size WxH]
     Write a generated test clip.";
 
@@ -763,6 +773,238 @@ fn sink_watch(mut a: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// What the user has to do next for the OBS route, in plain steps (T-072).
+/// The words live in `ec-sink`, so the app's window shows the same guide.
+#[cfg(target_os = "macos")]
+fn obs_next_steps(state: ec_sink::obs_mac::ObsState) -> String {
+    let mut text = state.headline().to_string();
+    for (n, step) in state.steps().iter().enumerate() {
+        text.push_str(&format!("\n{}. {step}", n + 1));
+    }
+    if !state.steps().is_empty() {
+        text.push_str("\nThen run this check again.");
+    }
+    text
+}
+
+#[cfg(target_os = "macos")]
+fn obs_check(a: Args) -> Result<(), String> {
+    a.done()?;
+    let cameras = ec_sink::obs_mac::list_cameras();
+    println!("cameras macOS knows ({}):", cameras.len());
+    for c in &cameras {
+        println!("  {}  (id {}, {} stream(s))", c.name, c.uid, c.streams);
+    }
+    println!("{}", obs_next_steps(ec_sink::obs_mac::obs_state()));
+    Ok(())
+}
+
+/// Play a clip into OBS's camera (T-070), optionally corrected.
+#[cfg(target_os = "macos")]
+fn obs_send(mut a: Args) -> Result<(), String> {
+    use ec_sink::obs_mac::{obs_state, ObsCamera, ObsState};
+    let clip = a.value("--clip")?.ok_or("obs-send needs --clip FILE.y4m")?;
+    let frames: usize = a.number("--frames", 900)?;
+    let correct = a.flag("--correct");
+    a.done()?;
+    let state = obs_state();
+    if state != ObsState::Ready {
+        return Err(obs_next_steps(state));
+    }
+    let mut source = Y4mSource::open(&clip, true).map_err(|e| e.to_string())?;
+    let fps = source.nominal_fps().unwrap_or(30.0);
+    let (w, h) = source.size();
+    println!("source: {}", source.describe());
+    let mut pipeline = if correct {
+        Some(Pipeline::new(1).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let mut camera = ObsCamera::open(w, h).map_err(|e| e.to_string())?;
+    println!("sending {frames} frames at {fps:.0} a second to \"OBS Virtual Camera\"; pick it in a meeting app");
+    let mut times = Timings::default();
+    let start = Instant::now();
+    for n in 0..frames {
+        let Some(mut frame) = source.next_frame().map_err(|e| e.to_string())? else {
+            break;
+        };
+        if let Some(p) = &mut pipeline {
+            frame = p
+                .process(frame, n as f64 / fps)
+                .map_err(|e| e.to_string())?
+                .frame;
+        }
+        let t = Instant::now();
+        camera.send(&frame).map_err(|e| e.to_string())?;
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        let due = start + Duration::from_secs_f64((n + 1) as f64 / fps);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    }
+    println!(
+        "sent {} frames in {:.1} s, {} let go because the camera's queue was full",
+        times.len() as u64 - camera.dropped,
+        start.elapsed().as_secs_f64(),
+        camera.dropped
+    );
+    println!(
+        "handing one frame over (convert + copy + queue): median {:.3} ms, p95 {:.3} ms",
+        times.median().unwrap_or(0.0),
+        times.p95().unwrap_or(0.0)
+    );
+    Ok(())
+}
+
+/// The numbered test picture for `obs-delay`: grey, with the frame number
+/// written across the top as 16 black or white squares, and the opposite
+/// pattern in a second row so a damaged picture can be told from a real one.
+#[cfg(target_os = "macos")]
+mod numbered {
+    use ec_core::{Frame, PixelFormat};
+
+    pub const W: u32 = 1280;
+    pub const H: u32 = 720;
+    const SQUARE: usize = 80; // 16 squares across 1280
+
+    pub fn make(number: u16) -> Frame {
+        let w = W as usize;
+        let mut data = vec![128u8; PixelFormat::I420.byte_len(W, H)];
+        for bit in 0..16 {
+            let on = number >> bit & 1 == 1;
+            for (row, white) in [(0, on), (1, !on)] {
+                let value = if white { 235 } else { 16 };
+                for y in row * SQUARE..(row + 1) * SQUARE {
+                    data[y * w + bit * SQUARE..][..SQUARE].fill(value);
+                }
+            }
+        }
+        Frame::new(W, H, PixelFormat::I420, data, number as u64).unwrap()
+    }
+
+    /// The middles of the 32 squares, as positions from 0 to 1: first row, then second.
+    pub fn points() -> Vec<(f32, f32)> {
+        let mut p = Vec::new();
+        for row in 0..2 {
+            for bit in 0..16 {
+                p.push((
+                    (bit * SQUARE + SQUARE / 2) as f32 / W as f32,
+                    (row * SQUARE + SQUARE / 2) as f32 / H as f32,
+                ));
+            }
+        }
+        p
+    }
+
+    /// The number, from the brightness at [`points`]. `None` if the two rows
+    /// do not agree (not our picture, or damaged).
+    pub fn read(brightness: &[u8]) -> Option<u16> {
+        if brightness.len() != 32 {
+            return None;
+        }
+        let mut number = 0u16;
+        for bit in 0..16 {
+            let (top, bottom) = (brightness[bit] > 128, brightness[16 + bit] > 128);
+            if top == bottom {
+                return None;
+            }
+            if top {
+                number |= 1 << bit;
+            }
+        }
+        Some(number)
+    }
+}
+
+/// Measure what OBS's camera adds: delay and lost pictures (T-071).
+#[cfg(target_os = "macos")]
+fn obs_delay(mut a: Args) -> Result<(), String> {
+    use ec_sink::obs_mac::{obs_state, ObsCamera, ObsState, ObsViewer};
+    let seconds: u32 = a.number("--seconds", 10)?;
+    a.done()?;
+    let state = obs_state();
+    if state != ObsState::Ready {
+        return Err(obs_next_steps(state));
+    }
+    // macOS asks for camera permission for any program that reads a camera
+    request_camera_permission(Duration::from_secs(60)).map_err(|e| e.to_string())?;
+
+    let total = (seconds * 30) as usize;
+    let mut camera = ObsCamera::open(numbered::W, numbered::H).map_err(|e| e.to_string())?;
+    let mut viewer = ObsViewer::open().map_err(|e| e.to_string())?;
+    let points = numbered::points();
+    println!("sending {total} numbered pictures at 30 a second and reading them back");
+
+    let mut sent_at: Vec<Option<Instant>> = vec![None; total];
+    let mut seen = vec![false; total];
+    let mut delays = Timings::default();
+    let (mut unreadable, mut repeats, mut pictures) = (0usize, 0usize, 0usize);
+    let mut delivers = String::new();
+    // Take every picture that has arrived; called every millisecond.
+    let mut take = |sent_at: &[Option<Instant>]| {
+        while let Some(s) = viewer.look(&points) {
+            pictures += 1;
+            delivers = format!("{}x{} {}", s.width, s.height, s.layout);
+            match numbered::read(&s.brightness).map(|n| n as usize) {
+                Some(n) if n < total && sent_at[n].is_some() => {
+                    if seen[n] {
+                        repeats += 1;
+                    } else {
+                        seen[n] = true;
+                        delays.push(sent_at[n].unwrap().elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                _ => unreadable += 1,
+            }
+        }
+    };
+    let start = Instant::now();
+    for n in 0..total {
+        let frame = numbered::make(n as u16);
+        sent_at[n] = Some(Instant::now());
+        camera.send(&frame).map_err(|e| e.to_string())?;
+        let due = start + Duration::from_secs_f64((n + 1) as f64 / 30.0);
+        while Instant::now() < due {
+            take(&sent_at);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // the last pictures are still on their way
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        take(&sent_at);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    println!("the camera delivers: {delivers} ({pictures} pictures in all)");
+    println!(
+        "{total} sent, {} arrived ({} never arrived), {repeats} arrived more than once, {unreadable} unreadable, {} let go at the queue",
+        delays.len(),
+        total - delays.len(),
+        camera.dropped
+    );
+    if !delays.is_empty() {
+        println!(
+            "delay from handing a picture to OBS's camera until a reader has it (checked every 1 ms): median {:.1} ms, p95 {:.1} ms",
+            delays.median().unwrap_or(0.0),
+            delays.p95().unwrap_or(0.0)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn obs_delay(_: Args) -> Result<(), String> {
+    Err("obs-delay is for macOS; on Windows Icontact has its own camera".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn obs_check(_: Args) -> Result<(), String> {
+    Err("obs-check is for macOS; on Windows Icontact has its own camera".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn obs_send(_: Args) -> Result<(), String> {
+    Err("obs-send is for macOS; on Windows Icontact has its own camera".into())
+}
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -779,6 +1021,9 @@ fn main() -> ExitCode {
         "eye-dump" => eye_dump(Args(args)),
         "sink-send" => sink_send(Args(args)),
         "sink-watch" => sink_watch(Args(args)),
+        "obs-check" => obs_check(Args(args)),
+        "obs-send" => obs_send(Args(args)),
+        "obs-delay" => obs_delay(Args(args)),
         "make-clip" => make_clip(Args(args)),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

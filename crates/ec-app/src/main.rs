@@ -23,7 +23,8 @@ use ec_vision::{points, Correction, Face, Level, Pipeline};
 use eframe::egui;
 
 enum Source {
-    Camera(u32),
+    /// A camera by its number, or `None` for the first real one.
+    Camera(Option<u32>),
     Pattern,
     Clip(String),
 }
@@ -34,6 +35,9 @@ enum Source {
 enum Status {
     Opened(String),
     Failed(String),
+    /// What is happening with the fake camera, as one line for the window.
+    /// The camera-output line, and the set-up steps still to do (empty when none).
+    Output(String, &'static [&'static str]),
 }
 
 /// Runs on its own thread: opens the source and pushes every frame into the one-place slot.
@@ -53,8 +57,13 @@ fn capture_loop(
         Source::Clip(path) => {
             Y4mSource::open(path, true).map(|c| Box::new(c) as Box<dyn FrameSource>)
         }
+        // No number given: the first real camera, never a fake one such as
+        // OBS's (that is where our own picture goes out).
         Source::Camera(i) => request_camera_permission(Duration::from_secs(120))
-            .and_then(|()| CameraSource::open(*i, 1280, 720, 30))
+            .and_then(|()| match i {
+                Some(i) => CameraSource::open(*i, 1280, 720, 30),
+                None => CameraSource::open_default(1280, 720, 30),
+            })
             .map(|c| Box::new(c) as Box<dyn FrameSource>),
     };
     let mut src = match opened {
@@ -100,6 +109,117 @@ struct Controls {
     /// The strength slider, 0 to 1. There is no atomic `f32`, so the number's
     /// 32 bits are kept in an atomic `u32` (`to_bits` / `from_bits`).
     strength: AtomicU32,
+    /// Send the finished frames to the fake camera that meeting apps pick.
+    sending: AtomicBool,
+}
+
+/// The way out to meeting apps (spec stage 6b). On a Mac that is OBS's
+/// installed camera; on other systems nothing is sent yet.
+struct Output {
+    #[cfg(target_os = "macos")]
+    camera: Option<ec_sink::obs_mac::ObsCamera>,
+    /// The size the camera was opened for; a frame of another size reopens it.
+    #[cfg(target_os = "macos")]
+    size: (u32, u32),
+    /// When opening the camera was last tried, so a missing camera is not asked for 30 times a second.
+    #[cfg(target_os = "macos")]
+    tried: Option<Instant>,
+    /// The last line reported, to report only changes.
+    line: String,
+    /// The set-up steps the window should show under that line (T-072).
+    steps: &'static [&'static str],
+}
+
+/// What `Output::send` reports when something changed: the line and the steps.
+type OutputNews = (String, &'static [&'static str]);
+
+impl Output {
+    fn new() -> Output {
+        Output {
+            #[cfg(target_os = "macos")]
+            camera: None,
+            #[cfg(target_os = "macos")]
+            size: (0, 0),
+            #[cfg(target_os = "macos")]
+            tried: None,
+            line: String::new(),
+            steps: &[],
+        }
+    }
+
+    /// Report the line and steps, but only when they differ from last time.
+    fn news(&mut self, line: String, steps: &'static [&'static str]) -> Option<OutputNews> {
+        (line != self.line || steps != self.steps).then(|| {
+            self.line = line.clone();
+            self.steps = steps;
+            (line, steps)
+        })
+    }
+
+    /// Hand one finished frame to the fake camera, if sending is on. Never
+    /// stops the pipeline: when the camera is missing or refuses, the reason
+    /// goes to the window and the next attempt waits two seconds.
+    #[cfg(target_os = "macos")]
+    fn send(&mut self, frame: &Frame, on: bool) -> Option<OutputNews> {
+        use ec_sink::obs_mac::{obs_state, ObsCamera};
+        let size = (frame.width(), frame.height());
+        let mut steps = self.steps;
+        let line = if !on {
+            steps = &[];
+            self.camera = None; // closing it stops the camera
+            self.tried = None;
+            "off".to_string()
+        } else {
+            if self.camera.is_some() && self.size != size {
+                self.camera = None;
+                self.tried = None;
+            }
+            let may_try = self
+                .tried
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+            let mut problem = None;
+            if self.camera.is_none() && may_try {
+                self.tried = Some(Instant::now());
+                match ObsCamera::open(size.0, size.1) {
+                    Ok(c) => (self.camera, self.size) = (Some(c), size),
+                    Err(e) => {
+                        // Say why in the user's terms: if the one-time OBS
+                        // set-up is not finished, show its steps instead of
+                        // the raw error. Asked only here, every two seconds.
+                        let state = obs_state();
+                        steps = state.steps();
+                        problem = Some(if steps.is_empty() {
+                            e.to_string()
+                        } else {
+                            state.headline().to_string()
+                        });
+                    }
+                }
+            }
+            if let Some(c) = &mut self.camera {
+                steps = &[];
+                if let Err(e) = c.send(frame) {
+                    problem = Some(e.to_string());
+                    self.camera = None;
+                }
+            }
+            match (problem, &self.camera) {
+                (Some(p), _) => format!("not sending: {p}"),
+                (None, Some(_)) => format!(
+                    "sending {}x{} to \"OBS Virtual Camera\" (pick that camera in your meeting app)",
+                    size.0, size.1
+                ),
+                // between two attempts: keep showing why the last one failed
+                (None, None) => self.line.clone(),
+            }
+        };
+        self.news(line, steps)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn send(&mut self, _frame: &Frame, _on: bool) -> Option<OutputNews> {
+        self.news("not built for this system yet".to_string(), &[])
+    }
 }
 
 /// What the pipeline thread hands the window: the frame and what was found in it.
@@ -131,6 +251,7 @@ fn pipeline_loop(
             None
         }
     };
+    let mut output = Output::new();
     let mut first_frame_at = None;
     // `recv` waits for the next frame, and returns `None` once the capture thread is gone
     while let Some(frame) = frames.recv() {
@@ -169,6 +290,12 @@ fn pipeline_loop(
                 }
             }
         }
+        // Stage 6b: out to the meeting apps. With correction off this is the
+        // camera's own picture, passed through.
+        let sending = controls.sending.load(Ordering::Relaxed);
+        if let Some((line, steps)) = output.send(&tracked.frame, sending) {
+            let _ = status.send(Status::Output(line, steps));
+        }
         // an Err from the slot means the window is gone
         if out.send(tracked).is_err() {
             return;
@@ -193,6 +320,9 @@ struct App {
     exit_after: Option<Duration>,
     texture: Option<egui::TextureHandle>,
     source_line: String,
+    output_line: String,
+    /// The OBS set-up steps still to do, shown as a numbered list; empty when none.
+    output_steps: &'static [&'static str],
     error: Option<String>,
     frame_line: String,
     convert: Timings,
@@ -353,6 +483,10 @@ impl eframe::App for App {
             match s {
                 Status::Opened(line) => self.source_line = line,
                 Status::Failed(e) => self.error = Some(e),
+                Status::Output(line, steps) => {
+                    self.output_line = line;
+                    self.output_steps = steps;
+                }
             }
         }
         self.take_frame(ui.ctx());
@@ -372,6 +506,10 @@ impl eframe::App for App {
                 self.corrected,
                 self.track.median()
             );
+            println!("camera output: {}", self.output_line);
+            for (n, step) in self.output_steps.iter().enumerate() {
+                println!("  {}. {step}", n + 1);
+            }
             println!("error: {:?}", self.error);
             self.exit_after = None; // print once; the window takes a frame or two to close
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -429,6 +567,24 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.show_original, "Show original");
             });
             ui.label(self.correction_line());
+            ui.horizontal(|ui| {
+                let mut on = self.controls.sending.load(Ordering::Relaxed);
+                if ui.checkbox(&mut on, "Send to camera").changed() {
+                    self.controls.sending.store(on, Ordering::Relaxed);
+                }
+                ui.label(format!("Camera output: {}", self.output_line));
+            });
+            // The one-time set-up guide (T-072). It goes away by itself: the
+            // pipeline tries the camera again every two seconds.
+            if !self.output_steps.is_empty() {
+                ui.group(|ui| {
+                    ui.label("To send your picture to meeting apps, set OBS's camera up once:");
+                    for (n, step) in self.output_steps.iter().enumerate() {
+                        ui.label(format!("{}. {step}", n + 1));
+                    }
+                    ui.label("This box goes away by itself when the camera is found.");
+                });
+            }
             if let Some(tex) = &self.texture {
                 let avail = ui.available_size();
                 let [w, h] = tex.size();
@@ -462,10 +618,10 @@ fn main() -> eframe::Result {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [] => Source::Camera(0),
+        [] => Source::Camera(None),
         ["--pattern"] => Source::Pattern,
         ["--clip", path] => Source::Clip(path.to_string()),
-        ["--camera", n] if n.parse::<u32>().is_ok() => Source::Camera(n.parse().unwrap_or(0)),
+        ["--camera", n] if n.parse::<u32>().is_ok() => Source::Camera(n.parse().ok()),
         _ => {
             eprintln!(
                 "usage: ec-app [--camera N | --pattern | --clip FILE.y4m] [--exit-after SECS]"
@@ -491,6 +647,7 @@ fn main() -> eframe::Result {
                 tracking: AtomicBool::new(true),
                 correcting: AtomicBool::new(true),
                 strength: AtomicU32::new(ec_vision::DEFAULT_STRENGTH.to_bits()),
+                sending: AtomicBool::new(true),
             });
 
             let (ctx, status_for_capture) = (cc.egui_ctx.clone(), status_tx.clone());
@@ -519,6 +676,8 @@ fn main() -> eframe::Result {
                 exit_after,
                 texture: None,
                 source_line: String::new(),
+                output_line: String::new(),
+                output_steps: &[],
                 error: None,
                 frame_line: String::new(),
                 convert: Timings::default(),

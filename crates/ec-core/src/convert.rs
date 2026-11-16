@@ -289,9 +289,130 @@ pub fn i420_to_yuyv(i420: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// Any frame to UYVY (packed U, Y0, V, Y1: two pixels per four bytes), written
+/// into `out`, which must hold `width * height * 2` bytes. Returns `false` and
+/// writes nothing if the frame's width is odd (UYVY stores colour per pixel pair)
+/// or `out` has the wrong size.
+///
+/// UYVY is what the macOS fake camera takes (T-070). This is a whole-frame
+/// conversion, the one place the corrected frame leaves the camera's format.
+pub fn frame_to_uyvy(frame: &Frame, out: &mut [u8]) -> bool {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    if w % 2 != 0 || out.len() != w * h * 2 {
+        return false;
+    }
+    let data = frame.data();
+    let cw = w / 2;
+    match frame.format() {
+        // Same samples as UYVY, in another order: Y0 U Y1 V -> U Y0 V Y1.
+        PixelFormat::Yuyv => {
+            // `as_chunks` cuts a slice into fixed-size arrays (here 4 bytes each)
+            let (groups_out, groups_in) = (out.as_chunks_mut::<4>().0, data.as_chunks::<4>().0);
+            for (o, i) in groups_out.iter_mut().zip(groups_in) {
+                *o = [i[1], i[0], i[3], i[2]];
+            }
+        }
+        // Half-height colour: each colour row serves the two picture rows it covers.
+        PixelFormat::Nv12 | PixelFormat::I420 => {
+            let nv12 = frame.format() == PixelFormat::Nv12;
+            let colour = &data[w * h..];
+            let v_plane = cw * (h / 2); // where I420's V plane starts within `colour`
+            for y in 0..h {
+                let luma = &data[y * w..][..w];
+                let row = &mut out[y * w * 2..][..w * 2];
+                let c = (y / 2) * cw;
+                for cx in 0..cw {
+                    let (u, v) = if nv12 {
+                        (colour[(c + cx) * 2], colour[(c + cx) * 2 + 1])
+                    } else {
+                        (colour[c + cx], colour[v_plane + c + cx])
+                    };
+                    row[cx * 4..][..4].copy_from_slice(&[u, luma[cx * 2], v, luma[cx * 2 + 1]]);
+                }
+            }
+        }
+        // Brightness per pixel; colour is the average of each pixel pair.
+        PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
+            let (r, b) = if frame.format() == PixelFormat::Rgb24 {
+                (0, 2)
+            } else {
+                (2, 0)
+            };
+            // two pixels in (6 bytes), two pixels out (4 bytes)
+            let (groups_out, groups_in) = (out.as_chunks_mut::<4>().0, data.as_chunks::<6>().0);
+            for (o, i) in groups_out.iter_mut().zip(groups_in) {
+                let [y0, u0, v0] = rgb_to_yuv(i[r], i[1], i[b]);
+                let [y1, u1, v1] = rgb_to_yuv(i[3 + r], i[4], i[3 + b]);
+                // the average of the pair, halves rounded up
+                *o = [
+                    (u0 as u16 + u1 as u16).div_ceil(2) as u8,
+                    y0,
+                    (v0 as u16 + v1 as u16).div_ceil(2) as u8,
+                    y1,
+                ];
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UYVY back to YUYV, to compare with conversions that already have tests.
+    fn uyvy_as_yuyv(uyvy: &[u8]) -> Vec<u8> {
+        let groups = uyvy.as_chunks::<4>().0;
+        groups
+            .iter()
+            .flat_map(|c| [c[1], c[0], c[3], c[2]])
+            .collect()
+    }
+
+    #[test]
+    fn every_format_gives_the_same_uyvy_picture() {
+        let (w, h) = (32u32, 16u32);
+        let rgb = smooth_rgb(w as usize, h as usize);
+        let i420 = rgb_to_i420(&rgb, w, h);
+        let yuyv = i420_to_yuyv(&i420, w, h);
+        let uyvy_of = |format, data: Vec<u8>| {
+            let f = Frame::new(w, h, format, data, 0).unwrap();
+            let mut out = vec![0u8; (w * h * 2) as usize];
+            assert!(frame_to_uyvy(&f, &mut out));
+            out
+        };
+        // The three camera formats hold the same samples: exactly equal.
+        let from_yuyv = uyvy_of(PixelFormat::Yuyv, yuyv.clone());
+        assert_eq!(uyvy_as_yuyv(&from_yuyv), yuyv);
+        assert_eq!(uyvy_of(PixelFormat::I420, i420.clone()), from_yuyv);
+        assert_eq!(
+            uyvy_of(PixelFormat::Nv12, i420_to_nv12(&i420, w, h)),
+            from_yuyv
+        );
+        // From RGB the brightness is exact; the colour is averaged over two
+        // pixels here and over four in the others, so it may differ a little
+        // on this smooth picture.
+        let from_rgb = uyvy_of(PixelFormat::Rgb24, rgb.clone());
+        let pixels = rgb.as_chunks::<3>().0;
+        let bgr: Vec<u8> = pixels.iter().flat_map(|p| [p[2], p[1], p[0]]).collect();
+        assert_eq!(uyvy_of(PixelFormat::Bgr24, bgr), from_rgb);
+        for (i, (a, b)) in from_rgb.iter().zip(&from_yuyv).enumerate() {
+            let limit = if i % 2 == 1 { 0 } else { 3 }; // odd bytes are brightness
+            assert!(
+                (*a as i32 - *b as i32).abs() <= limit,
+                "byte {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn uyvy_refuses_an_odd_width_or_a_wrong_sized_buffer() {
+        let f = Frame::new(5, 4, PixelFormat::Rgb24, vec![0; 60], 0).unwrap();
+        assert!(!frame_to_uyvy(&f, &mut [0u8; 40]));
+        let f = Frame::new(4, 4, PixelFormat::Rgb24, vec![0; 48], 0).unwrap();
+        assert!(!frame_to_uyvy(&f, &mut [0u8; 31]));
+        assert!(frame_to_uyvy(&f, &mut [0u8; 32]));
+    }
 
     /// A smooth picture: colour changes slowly, so half-size colour planes lose little.
     fn smooth_rgb(w: usize, h: usize) -> Vec<u8> {

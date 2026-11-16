@@ -964,6 +964,7 @@ version = "0.0.1"
 dependencies = [
  "ec-capture",
  "ec-core",
+ "ec-sink",
  "ec-vision",
  "eframe",
 ]

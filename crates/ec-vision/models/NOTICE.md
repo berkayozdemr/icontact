@@ -4,7 +4,7 @@
 |---|---|---|---|
 | `face_detector.onnx` | Face detector ("BlazeFace short range") | Google MediaPipe, inside `face_landmarker.task` | Apache-2.0 |
 | `face_landmarks_detector.onnx` | Face mesh, 478 points with iris | Google MediaPipe, inside `face_landmarker.task` | Apache-2.0 |
-| `warp.onnx` | The eye-turning model, v2 | Ours: trained with `training/` on eyes rendered from MakeHuman CC0 assets. A copy of `training/runs/v2/warp.onnx` | MIT OR Apache-2.0 |
+| `warp.onnx` | The eye-turning model, pc2 (round 2: half-size network, more varied training eyes) | Ours: trained with `training/` on eyes rendered from MakeHuman CC0 assets. A copy of `training/results/round2_step3/pc2/warp.onnx` (branch `training/round2`) | MIT OR Apache-2.0 |
 
 The two MediaPipe files were taken out of
 `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`

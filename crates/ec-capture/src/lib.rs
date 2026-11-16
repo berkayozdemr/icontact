@@ -4,7 +4,10 @@ mod camera;
 mod synthetic;
 pub mod y4m;
 
-pub use camera::{list_cameras, request_camera_permission, CameraDescription, CameraSource};
+pub use camera::{
+    is_fake_camera, list_cameras, pick_real_camera, request_camera_permission, CameraDescription,
+    CameraSource,
+};
 pub use synthetic::SyntheticSource;
 pub use y4m::{Y4mSource, Y4mWriter};
 

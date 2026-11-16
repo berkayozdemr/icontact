@@ -12,10 +12,15 @@
 //! reader, a reader never waits for the writer, and a frame nobody fetched in
 //! time is simply replaced. A meeting app must never freeze because of us.
 //!
+//! That is the Windows route. On a Mac there is no camera of our own: frames
+//! are pushed straight into OBS's installed camera instead (`obs_mac`).
+//!
 //! The exact byte layout is in [`layout`]. It is written down to the byte
 //! because the Windows 10 camera that reads it is C++, not Rust.
 
 pub mod layout;
+#[cfg(target_os = "macos")]
+pub mod obs_mac;
 mod reader;
 mod writer;
 
@@ -34,6 +39,9 @@ pub enum SinkError {
     TooBig { needed: usize, room: usize },
     /// Another running app is already writing into this block.
     Busy { pid: u32 },
+    /// The fake camera could not be found or would not take a frame. The
+    /// text says what is wrong, in words for the user.
+    Camera(String),
 }
 
 impl std::fmt::Display for SinkError {
@@ -45,6 +53,7 @@ impl std::fmt::Display for SinkError {
                 f,
                 "frame of {needed} bytes does not fit the shared block ({room} bytes per frame)"
             ),
+            SinkError::Camera(why) => write!(f, "fake camera: {why}"),
             SinkError::Busy { pid } => {
                 write!(
                     f,
